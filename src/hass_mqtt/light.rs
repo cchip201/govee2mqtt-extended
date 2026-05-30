@@ -23,6 +23,7 @@ pub struct LightConfig {
     /// it is not passed
     pub state_topic: String,
     pub optimistic: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub supported_color_modes: Vec<String>,
     /// Flag that defines if the light supports brightness.
     pub brightness: bool,
@@ -163,14 +164,37 @@ impl DeviceLight {
         let effect_list = if segment.is_some() {
             vec![]
         } else {
-            match state.device_list_scenes(device).await {
-                Ok(scenes) => scenes,
-                Err(err) => {
-                    log::error!("Unable to list scenes for {device}: {err:#}");
-                    vec![]
+            let disable_effects = std::env::var("GOVEE_DISABLE_EFFECTS")
+                .map(|v| v == "true")
+                .unwrap_or(false);
+
+            if disable_effects {
+                vec![]
+            } else {
+                let mut scenes = match state.device_list_scenes(device).await {
+                    Ok(scenes) => scenes,
+                    Err(err) => {
+                        log::error!("Unable to list scenes for {device}: {err:#}");
+                        vec![]
+                    }
+                };
+
+                if let Ok(allowed) = std::env::var("GOVEE_ALLOWED_EFFECTS") {
+                    let allowed_list: Vec<String> = allowed
+                        .split(',')
+                        .map(|s| s.trim().to_lowercase())
+                        .collect();
+
+                    scenes.retain(|s| !s.is_empty() && allowed_list.contains(&s.to_lowercase()));
+                } else {
+                    scenes.retain(|s| !s.is_empty());
                 }
+
+                scenes
             }
         };
+
+        let effect = !effect_list.is_empty();
 
         let mut supported_color_modes = vec![];
 
@@ -224,7 +248,7 @@ impl DeviceLight {
                 supported_color_modes,
                 brightness,
                 brightness_scale: 100,
-                effect: true,
+                effect,
                 effect_list,
                 payload_available: "online".to_string(),
                 max_mireds,
@@ -235,5 +259,66 @@ impl DeviceLight {
             device_id: device.id.to_string(),
             state: state.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn light_config_with_color_modes(modes: Vec<String>) -> LightConfig {
+        LightConfig {
+            base: EntityConfig {
+                availability_topic: "govee/avail".to_string(),
+                name: None,
+                device_class: None,
+                origin: Origin::default(),
+                device: Device::default(),
+                unique_id: "govee_test_light".to_string(),
+                entity_category: None,
+                icon: None,
+            },
+            schema: "json".to_string(),
+            command_topic: "govee/cmd".to_string(),
+            state_topic: "govee/state".to_string(),
+            optimistic: false,
+            supported_color_modes: modes,
+            brightness: true,
+            brightness_scale: 100,
+            icon: None,
+            effect: false,
+            effect_list: vec![],
+            min_mireds: None,
+            max_mireds: None,
+            payload_available: "online".to_string(),
+        }
+    }
+
+    /// Regression test for the empty `supported_color_modes` HA breakage:
+    /// an on/off-only light (no rgb, no color_temp) yields an empty vec, which
+    /// MUST be omitted from discovery — Home Assistant rejects `[]` and drops
+    /// the entity. See upstream wez/govee2mqtt#663.
+    #[test]
+    fn empty_supported_color_modes_is_omitted() {
+        let json = serde_json::to_value(light_config_with_color_modes(vec![])).unwrap();
+        assert!(
+            json.get("supported_color_modes").is_none(),
+            "empty supported_color_modes must be skipped, got: {json}"
+        );
+    }
+
+    /// When the device DOES support color modes, the field must be present so
+    /// Home Assistant exposes the rgb/color_temp controls.
+    #[test]
+    fn non_empty_supported_color_modes_is_serialized() {
+        let json = serde_json::to_value(light_config_with_color_modes(vec![
+            "rgb".to_string(),
+            "color_temp".to_string(),
+        ]))
+        .unwrap();
+        assert_eq!(
+            json.get("supported_color_modes"),
+            Some(&serde_json::json!(["rgb", "color_temp"])),
+        );
     }
 }
