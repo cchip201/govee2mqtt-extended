@@ -63,6 +63,11 @@ Notes:
   idempotent.
 - Brightness is deliberately not part of the payload — use the light's
   normal brightness control.
+- `sensitivity` here writes the device's LAN/BLE slot — the one the
+  `aa 05 13` read-back reports. The Platform API's `musicMode.sensitivity`
+  (used by the `Music: <style>` effects and any HA sensitivity preference
+  built on it) is a different slot; the two do not reflect each other, and
+  this topic is deliberately not bound to that entity.
 - The LAN `devStatus` poll keeps reporting the last static colour while
   the device dances; the reliable "am I in music mode?" signal is the
   `mode` field from AWS IoT status pushes (see the `mode`/`mode_updated`
