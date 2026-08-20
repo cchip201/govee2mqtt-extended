@@ -442,8 +442,13 @@ impl SetSceneCode {
 /// is the SKU-specific style id from [`crate::music::music_profile`] —
 /// it is not the Platform API's `musicMode` enum value.
 ///
-/// Captured from app traffic and verified on H607C/H6020/H60B0 hardware;
-/// methodology and per-frame semantics in `docs/MUSIC_MODE.md`.
+/// Frame layout captured from app traffic. Hardware verification: 2- and
+/// 5-colour writes (the latter exercising a non-empty `a3 ff` spill) were
+/// accepted by an H607C, confirmed via its IoT ptReal echo and `aa 05 13`
+/// read-back (`proof/music-palette-runtime.log`,
+/// `proof/music-palette-spill-runtime.log`). Other palette sizes are
+/// golden-tested against the Python reference only. Methodology and
+/// per-frame semantics in `docs/MUSIC_MODE.md`.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct SetMusicPalette {
     pub profile: u8,

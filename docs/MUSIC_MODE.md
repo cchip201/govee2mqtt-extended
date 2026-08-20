@@ -21,7 +21,7 @@ an arbitrary palette by speaking the device's internal protocol over LAN
 
 The topic only acts when the bridge runs with:
 
-```
+```sh
 GOVEE_MUSIC_PALETTE=true
 ```
 
@@ -86,7 +86,12 @@ SKUs, and ids are not portable. The mapped SKUs live in
 | H6020 | Table lamp | Rhythm, Beat A, Gridding, Energic, Dandelion, Drifting |
 | H60B0 | Uplighter floor lamp | Stippling, Hopping, Luminous, Rhythm, Flowing Light, Sprouting, Shiny |
 
-All current entries were captured and visually verified on real hardware.
+The style ids above were captured from app traffic and visually verified
+on the three SKUs. The palette frames themselves have live runtime
+verification on H607C only (2- and 5-colour writes, confirmed by the
+device's IoT echo and `aa 05 13` read-back — see `proof/`); on H6020 and
+H60B0 they rely on the shared classic dialect and golden tests against
+the Python reference the styles were validated with.
 Some SKUs (e.g. H7025) use a different frame dialect with per-style
 trailing bytes and are intentionally not supported yet.
 
