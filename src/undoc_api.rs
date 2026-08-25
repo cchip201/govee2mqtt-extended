@@ -5,8 +5,12 @@ use crate::cache::{
 use crate::lan_api::{boolean_int, truthy};
 use crate::opt_env_var;
 use crate::platform_api::{
-    from_json, http_response_body, DeviceCapability, DeviceCapabilityKind, DeviceParameters,
-    EnumOption,
+    from_json, from_json_with_policy, http_response_body, DeviceCapability, DeviceCapabilityKind,
+    DeviceParameters, EnumOption,
+};
+use crate::sensitive::{
+    describe_json_error_with_policy, describe_request_url, describe_sensitive_body_with_policy,
+    should_log_sensitive_data,
 };
 use anyhow::Context;
 use reqwest::Method;
@@ -25,6 +29,7 @@ const HALF_DAY: Duration = Duration::from_secs(3600 * 12);
 const ONE_DAY: Duration = Duration::from_secs(86400);
 const ONE_WEEK: Duration = Duration::from_secs(86400 * 7);
 const FIFTEEN_MINS: Duration = Duration::from_secs(60 * 15);
+const MAX_LOGIN_BODY_BYTES: usize = 64 * 1024;
 
 /// Cap on the 2FA verification response we will buffer or quote back in an
 /// error. Govee's real response is a few dozen bytes; anything larger is a
@@ -44,14 +49,6 @@ fn exceeds_verification_body_cap(so_far: usize, chunk_len: usize) -> bool {
 #[serde(transparent)]
 pub struct Redacted<T: std::fmt::Debug>(T);
 
-pub fn should_log_sensitive_data() -> bool {
-    if let Ok(Some(v)) = opt_env_var::<String>("GOVEE_LOG_SENSITIVE_DATA") {
-        truthy(&v).unwrap_or(false)
-    } else {
-        false
-    }
-}
-
 impl<T: std::fmt::Debug> std::fmt::Debug for Redacted<T> {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         if should_log_sensitive_data() {
@@ -67,6 +64,15 @@ impl<T: std::fmt::Debug> std::ops::Deref for Redacted<T> {
     fn deref(&self) -> &T {
         &self.0
     }
+}
+
+#[derive(Deserialize)]
+struct LoginResponse {
+    client: LoginAccountResponse,
+    #[serde(rename = "message")]
+    _message: String,
+    #[serde(rename = "status")]
+    _status: u64,
 }
 
 /// Inspect a Govee login response body for the `status` field. Govee uses
@@ -165,6 +171,100 @@ pub(crate) fn classify_2fa_login_error(err: &anyhow::Error) -> Option<(u64, bool
     let no_cache = err.downcast_ref::<NoCacheError>()?;
     let two_factor = no_cache.0.downcast_ref::<TwoFactorLoginError>()?;
     Some((two_factor.status, two_factor.code_was_set))
+}
+
+fn exceeds_login_body_cap(so_far: usize, chunk_len: usize) -> bool {
+    so_far.saturating_add(chunk_len) > MAX_LOGIN_BODY_BYTES
+}
+
+fn declared_login_body_exceeds_cap(length: u64) -> bool {
+    length > MAX_LOGIN_BODY_BYTES as u64
+}
+
+fn login_http_failure_message(
+    url: &reqwest::Url,
+    status: reqwest::StatusCode,
+    body: &[u8],
+) -> String {
+    login_http_failure_message_with_policy(url, status, body, should_log_sensitive_data())
+}
+
+fn login_http_failure_message_with_policy(
+    url: &reqwest::Url,
+    status: reqwest::StatusCode,
+    body: &[u8],
+    allow_sensitive: bool,
+) -> String {
+    let url = describe_request_url(url);
+    format!(
+        "request {url} status {}: {}. {}",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or(""),
+        describe_sensitive_body_with_policy(body, allow_sensitive)
+    )
+}
+
+fn parse_login_response(url: &reqwest::Url, body: &[u8]) -> anyhow::Result<LoginResponse> {
+    parse_login_response_with_policy(url, body, should_log_sensitive_data())
+}
+
+fn parse_login_response_with_policy(
+    url: &reqwest::Url,
+    body: &[u8],
+    allow_sensitive: bool,
+) -> anyhow::Result<LoginResponse> {
+    let url = describe_request_url(url);
+    serde_json_path_to_error::from_slice(body).map_err(|error| {
+        anyhow::anyhow!(
+            "parsing {url} login response: {}",
+            describe_json_error_with_policy::<LoginResponse>(&error, body, allow_sensitive)
+        )
+    })
+}
+
+async fn read_login_response_body(
+    mut response: reqwest::Response,
+) -> anyhow::Result<(reqwest::Url, reqwest::StatusCode, Vec<u8>)> {
+    let url = response.url().clone();
+    let diagnostic_url = describe_request_url(&url);
+    let status = response.status();
+    let declared_length = response.content_length();
+
+    if let Some(length) = declared_length {
+        if declared_login_body_exceeds_cap(length) {
+            let message = format!(
+                "request {diagnostic_url} status {}: {} response body exceeds the \
+                 {MAX_LOGIN_BODY_BYTES}-byte limit (declared length: {length} bytes)",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("")
+            );
+            return Err(classify_login_http_error(status.as_u16(), message));
+        }
+    }
+
+    let mut body = Vec::with_capacity(declared_length.unwrap_or(0) as usize);
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        classify_login_http_error(
+            status.as_u16(),
+            format!(
+                "reading request {diagnostic_url} status {} response body: {error}",
+                status.as_u16()
+            ),
+        )
+    })? {
+        if exceeds_login_body_cap(body.len(), chunk.len()) {
+            let message = format!(
+                "request {diagnostic_url} status {}: {} response body exceeded the \
+                 {MAX_LOGIN_BODY_BYTES}-byte limit while reading",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("")
+            );
+            return Err(classify_login_http_error(status.as_u16(), message));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok((url, status, body))
 }
 
 /// Build the right NoCacheError for a Govee login response status, or None if
@@ -754,9 +854,7 @@ impl GoveeUndocumentedApi {
         // statuses are wrapped in NoCacheError so cache_get skips the negative
         // cache write — the user must be able to retry with a fresh code within
         // the ~15 minute validity window.
-        let url = response.url().clone();
-        let status = response.status();
-        let body_bytes = response.bytes().await?;
+        let (url, status, body_bytes) = read_login_response_body(response).await?;
 
         if let Some(api_status) = classify_login_status(&body_bytes) {
             let cache = CACHE.load();
@@ -778,29 +876,11 @@ impl GoveeUndocumentedApi {
         }
 
         if !status.is_success() {
-            let msg = format!(
-                "request {url} status {}: {}. Response body: {}",
-                status.as_u16(),
-                status.canonical_reason().unwrap_or(""),
-                String::from_utf8_lossy(&body_bytes)
-            );
+            let msg = login_http_failure_message(&url, status, &body_bytes);
             return Err(classify_login_http_error(status.as_u16(), msg));
         }
 
-        #[derive(Deserialize, Serialize, Debug)]
-        #[allow(non_snake_case, dead_code)]
-        struct Response {
-            client: LoginAccountResponse,
-            message: String,
-            status: u64,
-        }
-
-        let resp: Response = serde_json::from_slice(&body_bytes).with_context(|| {
-            format!(
-                "parsing {url} login response: {}",
-                String::from_utf8_lossy(&body_bytes)
-            )
-        })?;
+        let resp = parse_login_response(&url, &body_bytes)?;
 
         let ttl =
             Duration::from_secs(resp.client.token_expire_cycle as u64).max(Duration::from_secs(60));
@@ -1491,11 +1571,18 @@ where
 pub fn embedded_json<'de, T: DeserializeOwned, D: serde::de::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<T, D::Error> {
+    embedded_json_with_policy(deserializer, should_log_sensitive_data())
+}
+
+fn embedded_json_with_policy<'de, T: DeserializeOwned, D: serde::de::Deserializer<'de>>(
+    deserializer: D,
+    allow_sensitive: bool,
+) -> Result<T, D::Error> {
     use serde::de::Error as _;
     let s = String::deserialize(deserializer)?;
-    from_json(if s.is_empty() { "null" } else { &s }).map_err(|e| {
+    from_json_with_policy(if s.is_empty() { "null" } else { &s }, allow_sensitive).map_err(|e| {
         D::Error::custom(format!(
-            "{} {e:#} while processing embedded json text {s}",
+            "{} {e:#} while processing embedded JSON",
             std::any::type_name::<T>()
         ))
     })
@@ -1505,7 +1592,80 @@ pub fn embedded_json<'de, T: DeserializeOwned, D: serde::de::Deserializer<'de>>(
 mod test {
     use super::*;
     use crate::platform_api::from_json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread::JoinHandle;
+
+    enum TestHttpBody {
+        DeclaredLength(usize),
+        Chunked(Vec<Vec<u8>>),
+    }
+
+    fn spawn_test_http_response(
+        status: reqwest::StatusCode,
+        body: TestHttpBody,
+    ) -> anyhow::Result<(reqwest::Url, JoinHandle<std::io::Result<()>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").context("binding loopback HTTP fixture")?;
+        let address = listener
+            .local_addr()
+            .context("reading loopback fixture address")?;
+        let url = reqwest::Url::parse(&format!("http://{address}/login?token=QUERY_SENTINEL"))
+            .context("building loopback fixture URL")?;
+
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+            let mut request = [0_u8; 4096];
+            stream.read(&mut request)?;
+
+            let reason = status.canonical_reason().unwrap_or("");
+            match body {
+                TestHttpBody::DeclaredLength(length) => {
+                    write!(
+                        stream,
+                        "HTTP/1.1 {} {reason}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n",
+                        status.as_u16()
+                    )?;
+                }
+                TestHttpBody::Chunked(chunks) => {
+                    write!(
+                        stream,
+                        "HTTP/1.1 {} {reason}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                        status.as_u16()
+                    )?;
+                    for chunk in chunks {
+                        write!(stream, "{:X}\r\n", chunk.len())?;
+                        stream.write_all(&chunk)?;
+                        stream.write_all(b"\r\n")?;
+                    }
+                    stream.write_all(b"0\r\n\r\n")?;
+                }
+            }
+            stream.flush()?;
+            Ok(())
+        });
+
+        Ok((url, server))
+    }
+
+    async fn fetch_test_http_response(
+        status: reqwest::StatusCode,
+        body: TestHttpBody,
+    ) -> anyhow::Result<(reqwest::Response, JoinHandle<std::io::Result<()>>)> {
+        let (url, server) = spawn_test_http_response(status, body)?;
+        let response = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .context("building loopback HTTP client")?
+            .get(url)
+            .send()
+            .await
+            .context("fetching loopback HTTP response")?;
+        Ok((response, server))
+    }
 
     fn fresh_cache() -> sqlite_cache::Cache {
         let connection = sqlite_cache::rusqlite::Connection::open_in_memory()
@@ -1519,6 +1679,55 @@ mod test {
             connection,
         )
         .expect("create in-memory cache")
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    struct EmbeddedNumericValue {
+        value: u64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    struct EmbeddedNumericEnvelope {
+        #[serde(deserialize_with = "embedded_json_without_sensitive_data")]
+        payload: EmbeddedNumericValue,
+    }
+
+    fn embedded_json_without_sensitive_data<
+        'de,
+        T: DeserializeOwned,
+        D: serde::de::Deserializer<'de>,
+    >(
+        deserializer: D,
+    ) -> Result<T, D::Error> {
+        embedded_json_with_policy(deserializer, false)
+    }
+
+    #[test]
+    fn embedded_json_error_withholds_rejected_string_value() {
+        let embedded = r#"{"value":"EMBEDDED_TOKEN_SENTINEL"}"#;
+        let body = format!(r#"{{"payload":{embedded:?}}}"#);
+        let error = serde_json::from_str::<EmbeddedNumericEnvelope>(&body)
+            .expect_err("embedded string must not deserialize as a numeric value");
+        let rendered = format!("{error:#}");
+
+        assert!(!rendered.contains("EMBEDDED_TOKEN_SENTINEL"), "{rendered}");
+        assert!(
+            rendered.contains("EmbeddedNumericValue JSON Data error"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("while processing embedded JSON"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "Response body withheld ({} bytes)",
+                embedded.len()
+            )),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -2277,6 +2486,218 @@ mod test {
     fn http_error_message_propagates_through_classify() {
         let err = classify_login_http_error(502, "bad gateway upstream".to_string());
         assert!(format!("{err:#}").contains("bad gateway upstream"));
+    }
+
+    #[test]
+    fn login_http_error_withholds_echoed_credentials_by_default() {
+        let url = reqwest::Url::parse("https://app2.govee.com/account/rest/account/v1/login")
+            .expect("test URL must parse");
+        let body = br#"{"email":"EMAIL_SENTINEL@example.com","password":"PASSWORD_SENTINEL"}"#;
+        let message = login_http_failure_message_with_policy(
+            &url,
+            reqwest::StatusCode::UNAUTHORIZED,
+            body,
+            false,
+        );
+        let error = classify_login_http_error(401, message);
+        let rendered = format!("{error:#}");
+
+        assert!(!rendered.contains("EMAIL_SENTINEL"), "{rendered}");
+        assert!(!rendered.contains("PASSWORD_SENTINEL"), "{rendered}");
+        assert!(rendered.contains(url.as_str()), "{rendered}");
+        assert!(rendered.contains("status 401: Unauthorized"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("Response body withheld ({} bytes)", body.len())),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn login_parse_error_withholds_client_tokens_by_default() {
+        let url = reqwest::Url::parse("https://app2.govee.com/account/rest/account/v1/login")
+            .expect("test URL must parse");
+        let body = br#"{
+            "client": {
+                "A": "A_SENTINEL",
+                "B": "B_SENTINEL",
+                "accountId": 42,
+                "client": "CLIENT_SENTINEL",
+                "isSavvyUser": false,
+                "refreshToken": "REFRESH_TOKEN_SENTINEL",
+                "token": "TOKEN_SENTINEL",
+                "tokenExpireCycle": "PASSWORD_SENTINEL",
+                "topic": "TOPIC_SENTINEL"
+            },
+            "message": "ok",
+            "status": 200
+        }"#;
+        let error = parse_login_response_with_policy(&url, body, false)
+            .err()
+            .expect("string token expiry must fail to deserialize as u32");
+        let rendered = format!("{error:#}");
+
+        for secret in [
+            "A_SENTINEL",
+            "B_SENTINEL",
+            "CLIENT_SENTINEL",
+            "REFRESH_TOKEN_SENTINEL",
+            "TOKEN_SENTINEL",
+            "PASSWORD_SENTINEL",
+            "TOPIC_SENTINEL",
+        ] {
+            assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
+        }
+        assert!(rendered.contains(url.as_str()), "{rendered}");
+        assert!(
+            rendered.contains("LoginResponse JSON Data error"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("line "), "{rendered}");
+        assert!(rendered.contains("column "), "{rendered}");
+        assert!(
+            rendered.contains(&format!("Response body withheld ({} bytes)", body.len())),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn login_response_still_parses_when_valid() {
+        let url = reqwest::Url::parse("https://app2.govee.com/account/rest/account/v1/login")
+            .expect("test URL must parse");
+        let body = br#"{
+            "client": {
+                "A": "a",
+                "B": "b",
+                "accountId": 42,
+                "client": "client-id",
+                "isSavvyUser": false,
+                "token": "access-token",
+                "tokenExpireCycle": 3600,
+                "topic": "account-topic"
+            },
+            "message": "ok",
+            "status": 200
+        }"#;
+
+        let response = parse_login_response_with_policy(&url, body, false)
+            .expect("valid login response must still parse");
+
+        assert_eq!(&**response.client.token, "access-token");
+        assert_eq!(response.client.token_expire_cycle, 3600);
+    }
+
+    #[test]
+    fn login_body_cap_covers_declared_and_accumulated_lengths() {
+        assert!(!declared_login_body_exceeds_cap(
+            MAX_LOGIN_BODY_BYTES as u64
+        ));
+        assert!(declared_login_body_exceeds_cap(
+            MAX_LOGIN_BODY_BYTES as u64 + 1
+        ));
+
+        assert!(!exceeds_login_body_cap(0, MAX_LOGIN_BODY_BYTES));
+        assert!(!exceeds_login_body_cap(MAX_LOGIN_BODY_BYTES - 1, 1));
+        assert!(exceeds_login_body_cap(MAX_LOGIN_BODY_BYTES - 1, 2));
+        assert!(exceeds_login_body_cap(usize::MAX, 1));
+    }
+
+    #[tokio::test]
+    async fn login_reader_accepts_chunked_body_at_limit() -> anyhow::Result<()> {
+        let first_len = MAX_LOGIN_BODY_BYTES / 2;
+        let chunks = vec![
+            vec![b'a'; first_len],
+            vec![b'b'; MAX_LOGIN_BODY_BYTES - first_len],
+        ];
+        let (response, server) =
+            fetch_test_http_response(reqwest::StatusCode::OK, TestHttpBody::Chunked(chunks))
+                .await?;
+
+        let result = read_login_response_body(response).await;
+        server
+            .join()
+            .map_err(|_| anyhow::anyhow!("loopback HTTP fixture panicked"))??;
+        let (url, status, body) = result.context("accepting a chunked body at the cap")?;
+
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body.len(), MAX_LOGIN_BODY_BYTES);
+        assert_eq!(url.path(), "/login");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn login_reader_rejects_oversized_declared_5xx_as_no_cache_error() -> anyhow::Result<()> {
+        let (response, server) = fetch_test_http_response(
+            reqwest::StatusCode::BAD_GATEWAY,
+            TestHttpBody::DeclaredLength(MAX_LOGIN_BODY_BYTES + 1),
+        )
+        .await?;
+
+        let error = read_login_response_body(response)
+            .await
+            .expect_err("an oversized declared response must be rejected");
+        server
+            .join()
+            .map_err(|_| anyhow::anyhow!("loopback HTTP fixture panicked"))??;
+        let rendered = format!("{error:#}");
+
+        assert!(error.downcast_ref::<NoCacheError>().is_some(), "{rendered}");
+        assert!(rendered.contains("declared length"), "{rendered}");
+        assert!(
+            rendered.contains(&(MAX_LOGIN_BODY_BYTES + 1).to_string()),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("QUERY_SENTINEL"), "{rendered}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn login_reader_rejects_oversized_chunked_5xx_as_no_cache_error() -> anyhow::Result<()> {
+        let first_len = MAX_LOGIN_BODY_BYTES / 2;
+        let chunks = vec![
+            vec![b'a'; first_len],
+            vec![b'b'; MAX_LOGIN_BODY_BYTES - first_len],
+            vec![b'c'],
+        ];
+        let (response, server) = fetch_test_http_response(
+            reqwest::StatusCode::BAD_GATEWAY,
+            TestHttpBody::Chunked(chunks),
+        )
+        .await?;
+
+        let error = read_login_response_body(response)
+            .await
+            .expect_err("a chunked response crossing the cap must be rejected");
+        server
+            .join()
+            .map_err(|_| anyhow::anyhow!("loopback HTTP fixture panicked"))??;
+        let rendered = format!("{error:#}");
+
+        assert!(error.downcast_ref::<NoCacheError>().is_some(), "{rendered}");
+        assert!(
+            rendered.contains("exceeded the 65536-byte limit"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("QUERY_SENTINEL"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn login_http_redaction_preserves_transient_error_classification() {
+        let url = reqwest::Url::parse("https://app2.govee.com/account/rest/account/v1/login")
+            .expect("test URL must parse");
+        let body = br#"{"password":"PASSWORD_SENTINEL"}"#;
+        let message = login_http_failure_message_with_policy(
+            &url,
+            reqwest::StatusCode::BAD_GATEWAY,
+            body,
+            false,
+        );
+        let error = classify_login_http_error(502, message);
+        let rendered = format!("{error:#}");
+
+        assert!(error.downcast_ref::<NoCacheError>().is_some());
+        assert!(!rendered.contains("PASSWORD_SENTINEL"), "{rendered}");
+        assert!(rendered.contains("status 502: Bad Gateway"), "{rendered}");
     }
 
     // --- DRY refactor: opt_arg_or_env behavior preserved ---
