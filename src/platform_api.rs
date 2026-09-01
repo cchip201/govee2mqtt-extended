@@ -27,10 +27,6 @@ const SERVER: &str = "https://openapi.api.govee.com";
 pub const ONE_WEEK: Duration = Duration::from_secs(86400 * 7);
 pub const FIVE_MINUTES: Duration = Duration::from_secs(5 * 60);
 
-fn endpoint(url: &str) -> String {
-    format!("{SERVER}{url}")
-}
-
 fn request_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -69,11 +65,105 @@ impl GoveeApiArguments {
 #[derive(Clone)]
 pub struct GoveeApiClient {
     key: String,
+    /// Per-client and test-only so an in-process capture server cannot redirect
+    /// unrelated Platform API clients running in parallel.
+    #[cfg(test)]
+    api_base: Option<String>,
+}
+
+/// Build the `music_setting` payload for a named style.
+///
+/// Returns `None` when the capability does not offer that style, which is the
+/// signal to fall through to the ordinary scene lookup. Split out from
+/// `set_scene_by_name_with_music_settings` so the wire shape is testable against
+/// the recorded device fixtures without an HTTP mock.
+fn build_music_mode_payload(
+    cap: &DeviceCapability,
+    music_mode: &str,
+    settings: MusicModeSettings,
+) -> Option<JsonValue> {
+    let value = cap.music_mode_parameter_by_name(music_mode)?;
+    let mut payload = serde_json::json!({
+        "musicMode": value,
+        // Govee's range is a percentage; clamp rather than trust the caller.
+        "sensitivity": settings.sensitivity.min(100),
+        // Supplying one RGB colour is the Platform API's signal to stop
+        // choosing colours automatically. It is not a multi-colour palette.
+        "autoColor": if settings.rgb.is_some() { 0 } else { 1 },
+    });
+    if let Some(rgb) = settings.rgb {
+        payload["rgb"] = json!(rgb.min(0x00ff_ffff));
+    }
+    Some(payload)
+}
+
+fn scene_value_from_capabilities<'a>(
+    capabilities: &'a [DeviceCapability],
+    scene: &str,
+) -> Option<(&'a DeviceCapability, JsonValue)> {
+    capabilities.iter().find_map(|capability| {
+        if !matches!(
+            capability.kind,
+            DeviceCapabilityKind::DynamicScene
+                | DeviceCapabilityKind::DynamicSetting
+                | DeviceCapabilityKind::Mode
+        ) {
+            return None;
+        }
+
+        let Some(DeviceParameters::Enum { options }) = &capability.parameters else {
+            return None;
+        };
+        options
+            .iter()
+            .find(|option| scene.eq_ignore_ascii_case(&option.name))
+            .map(|option| (capability, option.value.clone()))
+    })
+}
+
+/// Sensitivity this bridge sent unconditionally before the preference
+/// existed. Kept as the fallback so untouched installs are unchanged.
+pub const DEFAULT_MUSIC_SENSITIVITY: u8 = 100;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MusicModeSettings {
+    pub sensitivity: u8,
+    /// One packed `0xRRGGBB` colour. `None` leaves automatic colours enabled.
+    pub rgb: Option<u32>,
+}
+
+impl Default for MusicModeSettings {
+    fn default() -> Self {
+        Self {
+            sensitivity: DEFAULT_MUSIC_SENSITIVITY,
+            rgb: None,
+        }
+    }
 }
 
 impl GoveeApiClient {
     pub fn new<K: Into<String>>(key: K) -> Self {
-        Self { key: key.into() }
+        Self {
+            key: key.into(),
+            #[cfg(test)]
+            api_base: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test<K: Into<String>, B: Into<String>>(key: K, api_base: B) -> Self {
+        Self {
+            key: key.into(),
+            api_base: Some(api_base.into()),
+        }
+    }
+
+    fn endpoint(&self, url: &str) -> String {
+        #[cfg(test)]
+        if let Some(base) = &self.api_base {
+            return format!("{base}{url}");
+        }
+        format!("{SERVER}{url}")
     }
 
     pub async fn get_devices(&self) -> anyhow::Result<Vec<HttpDeviceInfo>> {
@@ -87,7 +177,7 @@ impl GoveeApiClient {
                 allow_stale: true,
             },
             async {
-                let url = endpoint("/router/api/v1/user/devices");
+                let url = self.endpoint("/router/api/v1/user/devices");
                 let resp: GetDevicesResponse = self.get_request_with_json_response(url).await?;
                 Ok(CacheComputeResult::Value(resp.data))
             },
@@ -112,7 +202,7 @@ impl GoveeApiClient {
         capability: &DeviceCapability,
         value: V,
     ) -> anyhow::Result<ControlDeviceResponseCapability> {
-        let url = endpoint("/router/api/v1/device/control");
+        let url = self.endpoint("/router/api/v1/device/control");
         let request = ControlDeviceRequest {
             request_id: request_id(),
             payload: ControlDevicePayload {
@@ -139,7 +229,7 @@ impl GoveeApiClient {
         &self,
         device: &HttpDeviceInfo,
     ) -> anyhow::Result<HttpDeviceState> {
-        let url = endpoint("/router/api/v1/device/state");
+        let url = self.endpoint("/router/api/v1/device/state");
         let request = GetDeviceStateRequest {
             request_id: request_id(),
             payload: GetDeviceStateRequestPayload {
@@ -174,7 +264,7 @@ impl GoveeApiClient {
                 allow_stale: true,
             },
             async {
-                let url = endpoint("/router/api/v1/device/diy-scenes");
+                let url = self.endpoint("/router/api/v1/device/diy-scenes");
                 let request = GetDeviceScenesRequest {
                     request_id: request_id(),
                     payload: GetDeviceScenesPayload {
@@ -212,7 +302,7 @@ impl GoveeApiClient {
                 allow_stale: true,
             },
             async {
-                let url = endpoint("/router/api/v1/device/scenes");
+                let url = self.endpoint("/router/api/v1/device/scenes");
                 let request = GetDeviceScenesRequest {
                     request_id: request_id(),
                     payload: GetDeviceScenesPayload {
@@ -333,6 +423,21 @@ impl GoveeApiClient {
         device: &HttpDeviceInfo,
         scene: &str,
     ) -> anyhow::Result<ControlDeviceResponseCapability> {
+        self.set_scene_by_name_with_music_settings(device, scene, MusicModeSettings::default())
+            .await
+    }
+
+    /// As [`Self::set_scene_by_name`], but carries the stored sensitivity and
+    /// optional single RGB colour exposed by the Platform API. A colour
+    /// disables `autoColor`; omitting it preserves the historical automatic
+    /// behaviour. Sensitivity cannot be sent on its own, so it rides the style
+    /// change that reaches the device.
+    pub async fn set_scene_by_name_with_music_settings(
+        &self,
+        device: &HttpDeviceInfo,
+        scene: &str,
+        settings: MusicModeSettings,
+    ) -> anyhow::Result<ControlDeviceResponseCapability> {
         if scene.is_empty() {
             // Can't set no scene
             anyhow::bail!("Cannot set scene to no-scene");
@@ -340,31 +445,24 @@ impl GoveeApiClient {
 
         if let Some(music_mode) = scene.strip_prefix("Music: ") {
             if let Some(cap) = device.capability_by_instance("musicMode") {
-                if let Some(field) = cap.struct_field_by_name("musicMode") {
-                    if let Some(value) = field.field_type.enum_parameter_by_name(music_mode) {
-                        let value = serde_json::json!({
-                            "musicMode": value,
-                            "sensitivity": 100,
-                            "autoColor": 1,
-                        });
-                        return self.control_device(device, cap, value).await;
-                    }
+                if let Some(value) = build_music_mode_payload(cap, music_mode, settings) {
+                    return self.control_device(device, cap, value).await;
                 }
             }
         }
 
+        // Device metadata is already one of `get_scene_caps`' sources and is
+        // authoritative enough to control directly. Resolve it first so a
+        // normal effect command does not need supplemental scene-catalog I/O.
+        if let Some((capability, value)) =
+            scene_value_from_capabilities(&device.capabilities, scene)
+        {
+            return self.control_device(device, capability, value).await;
+        }
+
         let caps = self.get_scene_caps(device).await?;
-        for cap in caps {
-            match &cap.parameters {
-                Some(DeviceParameters::Enum { options }) => {
-                    for opt in options {
-                        if scene.eq_ignore_ascii_case(&opt.name) {
-                            return self.control_device(device, &cap, opt.value.clone()).await;
-                        }
-                    }
-                }
-                _ => anyhow::bail!("set_scene_by_name: unexpected type {cap:#?}"),
-            }
+        if let Some((capability, value)) = scene_value_from_capabilities(&caps, scene) {
+            return self.control_device(device, capability, value).await;
         }
         anyhow::bail!("Scene '{scene}' is not available for this device");
     }
@@ -884,6 +982,50 @@ impl DeviceCapability {
             _ => None,
         }
     }
+
+    fn music_mode_options(&self) -> Option<&[EnumOption]> {
+        if self.kind != DeviceCapabilityKind::MusicSetting
+            || !self.instance.eq_ignore_ascii_case("musicMode")
+        {
+            return None;
+        }
+
+        match &self.struct_field_by_name("musicMode")?.field_type {
+            DeviceParameters::Enum { options } => Some(options),
+            _ => None,
+        }
+    }
+
+    /// Whether this capability can produce at least one valid Platform music
+    /// payload. Entity discovery and payload construction share this predicate
+    /// so incomplete metadata cannot publish a slider that controls nothing.
+    pub fn has_music_mode_options(&self) -> bool {
+        self.music_mode_options()
+            .map(|options| {
+                options
+                    .iter()
+                    .any(|option| enum_option_u32(&option.value).is_some())
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn music_mode_parameter_by_name(&self, name: &str) -> Option<u32> {
+        self.music_mode_options()?
+            .iter()
+            .find(|option| option.name == name)
+            .and_then(|option| enum_option_u32(&option.value))
+    }
+}
+
+/// A Govee enum option's `value` as a `u32`, or `None` when it is absent,
+/// non-integral, or outside the range the wire format can carry.
+///
+/// The unchecked `as u32` this replaces wrapped silently: a `-1` in malformed
+/// capability metadata became 4294967295, and 4294967296 became 0. Discovery
+/// then published a control that looked actionable and sent a value Govee
+/// rejects. `as_u64` rejects negatives before the width check does the rest.
+fn enum_option_u32(value: &JsonValue) -> Option<u32> {
+    u32::try_from(value.as_u64()?).ok()
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -916,8 +1058,8 @@ impl DeviceParameters {
         match self {
             DeviceParameters::Enum { options } => options
                 .iter()
-                .find(|e| e.name == name && e.value.is_i64())
-                .map(|e| e.value.as_i64().expect("i64") as u32),
+                .find(|e| e.name == name)
+                .and_then(|e| enum_option_u32(&e.value)),
             _ => None,
         }
     }
@@ -1176,7 +1318,7 @@ impl GoveeApiClient {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
     use serde::Deserialize;
 
@@ -1251,6 +1393,21 @@ mod test {
         assert_ne!(first, second);
         uuid::Uuid::parse_str(&first).unwrap();
         uuid::Uuid::parse_str(&second).unwrap();
+    }
+
+    #[test]
+    fn test_api_base_is_scoped_to_one_client() {
+        let ordinary = GoveeApiClient::new("test-key");
+        let redirected = GoveeApiClient::new_for_test("test-key", "http://127.0.0.1:12345");
+
+        assert_eq!(
+            ordinary.endpoint("/probe"),
+            "https://openapi.api.govee.com/probe"
+        );
+        assert_eq!(
+            redirected.endpoint("/probe"),
+            "http://127.0.0.1:12345/probe"
+        );
     }
 
     #[test]
@@ -1331,5 +1488,412 @@ mod test {
 
         assert!(rendered.contains("status=99"), "{rendered}");
         assert!(!rendered.contains("TOKEN_SENTINEL"), "{rendered}");
+    }
+
+    /// The recorded H6072 fixture carries a real `musicMode` capability, so
+    /// these assert the wire shape against Govee's own schema rather than a
+    /// hand-written stub.
+    fn music_capability() -> DeviceCapability {
+        music_device()
+            .capability_by_instance("musicMode")
+            .cloned()
+            .expect("fixture has a musicMode capability")
+    }
+
+    #[test]
+    fn music_payload_carries_the_requested_sensitivity() {
+        let cap = music_capability();
+        let payload = build_music_mode_payload(
+            &cap,
+            "Rhythm",
+            MusicModeSettings {
+                sensitivity: 55,
+                rgb: None,
+            },
+        )
+        .expect("Rhythm is a style in the fixture");
+
+        assert_eq!(payload["sensitivity"], 55);
+        assert_eq!(payload["autoColor"], 1);
+        assert!(
+            !payload["musicMode"].is_null(),
+            "the style must resolve to its enum value: {payload}"
+        );
+    }
+
+    /// The wire format carries `musicMode` as a u32. The unchecked cast this
+    /// replaces turned -1 into 4294967295 and 4294967296 into 0, so malformed
+    /// metadata could publish an actionable control that sends a value Govee
+    /// rejects. Boundaries are asserted on both sides of the u32 range.
+    #[test]
+    fn enum_option_values_outside_u32_are_rejected_not_wrapped() {
+        use serde_json::json;
+
+        assert_eq!(enum_option_u32(&json!(0)), Some(0));
+        assert_eq!(enum_option_u32(&json!(1)), Some(1));
+        assert_eq!(enum_option_u32(&json!(4294967295u64)), Some(u32::MAX));
+
+        // -1 wrapped to u32::MAX under `as u32`; 4294967296 wrapped to 0.
+        assert_eq!(enum_option_u32(&json!(-1)), None);
+        assert_eq!(enum_option_u32(&json!(4294967296u64)), None);
+
+        // Non-integral values were already excluded and must stay excluded.
+        assert_eq!(enum_option_u32(&json!("4")), None);
+        assert_eq!(enum_option_u32(&json!(1.5)), None);
+        assert_eq!(enum_option_u32(&json!(null)), None);
+    }
+
+    /// The discovery predicate and the lookup must agree. If `has_music_mode_options`
+    /// accepted a value the lookup then rejects, discovery publishes a slider whose
+    /// every write fails.
+    #[test]
+    fn music_mode_predicate_and_lookup_agree_on_out_of_range_values() {
+        use serde_json::json;
+
+        let mut cap = test::music_device()
+            .capability_by_instance("musicMode")
+            .cloned()
+            .expect("fixture has a musicMode capability");
+
+        if let Some(DeviceParameters::Struct { fields }) = &mut cap.parameters {
+            for field in fields.iter_mut() {
+                if field.field_name == "musicMode" {
+                    if let DeviceParameters::Enum { options } = &mut field.field_type {
+                        for option in options.iter_mut() {
+                            option.value = json!(-1);
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !cap.has_music_mode_options(),
+            "a capability whose only values are out of range offers nothing to select"
+        );
+    }
+
+    #[test]
+    fn music_payload_defaults_match_the_previous_hardcode() {
+        let cap = music_capability();
+        let payload = build_music_mode_payload(&cap, "Rhythm", MusicModeSettings::default())
+            .expect("Rhythm is a style in the fixture");
+
+        // Before the preference existed this call always sent 100/1. An
+        // install that never touches the slider must be byte-identical.
+        assert_eq!(payload["sensitivity"], 100);
+        assert_eq!(payload["autoColor"], 1);
+    }
+
+    #[test]
+    fn music_payload_clamps_out_of_range_sensitivity() {
+        let cap = music_capability();
+        let payload = build_music_mode_payload(
+            &cap,
+            "Rhythm",
+            MusicModeSettings {
+                sensitivity: 255,
+                rgb: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(payload["sensitivity"], 100);
+    }
+
+    #[test]
+    fn music_payload_uses_a_single_rgb_and_disables_auto_color() {
+        let cap = music_capability();
+        let payload = build_music_mode_payload(
+            &cap,
+            "Rhythm",
+            MusicModeSettings {
+                sensitivity: 55,
+                rgb: Some(0x123456),
+            },
+        )
+        .expect("Rhythm is a style in the fixture");
+
+        assert_eq!(payload["autoColor"], 0);
+        assert_eq!(payload["rgb"], 0x123456);
+    }
+
+    #[test]
+    fn music_payload_clamps_rgb_to_the_platform_range() {
+        let cap = music_capability();
+        let payload = build_music_mode_payload(
+            &cap,
+            "Rhythm",
+            MusicModeSettings {
+                sensitivity: 55,
+                rgb: Some(u32::MAX),
+            },
+        )
+        .expect("Rhythm is a style in the fixture");
+
+        assert_eq!(payload["rgb"], 0x00ff_ffff);
+    }
+
+    #[test]
+    fn music_payload_omits_rgb_and_keeps_auto_color_by_default() {
+        let cap = music_capability();
+        let payload = build_music_mode_payload(&cap, "Rhythm", MusicModeSettings::default())
+            .expect("Rhythm is a style in the fixture");
+
+        assert_eq!(payload["autoColor"], 1);
+        assert!(payload.get("rgb").is_none(), "{payload}");
+    }
+
+    #[test]
+    fn music_payload_is_none_for_an_unknown_style() {
+        let cap = music_capability();
+        assert!(
+            build_music_mode_payload(
+                &cap,
+                "NotAStyle",
+                MusicModeSettings {
+                    sensitivity: 50,
+                    rgb: None,
+                }
+            )
+            .is_none(),
+            "an unmapped style must fall through to the scene lookup, not \
+             send a malformed music_setting call"
+        );
+    }
+
+    /// A `musicMode` capability whose parameters are absent (or not a struct)
+    /// must yield no payload at all. Sending `music_setting` without the
+    /// required `musicMode` field is the 400 `Missing parameter` case; falling
+    /// through to the ordinary scene lookup is the correct recovery.
+    #[test]
+    fn music_payload_is_none_when_the_capability_has_no_music_mode_field() {
+        let cap = DeviceCapability {
+            kind: DeviceCapabilityKind::MusicSetting,
+            instance: "musicMode".to_string(),
+            parameters: None,
+            alarm_type: None,
+            event_state: None,
+        };
+
+        assert!(
+            build_music_mode_payload(
+                &cap,
+                "Rhythm",
+                MusicModeSettings {
+                    sensitivity: 50,
+                    rgb: None,
+                }
+            )
+            .is_none(),
+            "a capability with no musicMode struct field cannot produce a \
+             well-formed music_setting call"
+        );
+    }
+
+    // ---- Live Platform API path, exercised against a real in-process server ----
+    //
+    // The music payload tests above prove the JSON we *build*. These prove the
+    // JSON that actually leaves the process: `set_scene_by_name_with_music_settings`
+    // through `control_device`, `request_with_json_response`, reqwest, and back.
+    // No new dependency: axum and tokio are already in the tree, and the base URL
+    // override is `#[cfg(test)]` so production cannot reach it.
+
+    use std::sync::{Arc, Mutex};
+
+    /// Requests the bridge sent, captured in order.
+    pub(crate) type Captured = Arc<Mutex<Vec<JsonValue>>>;
+
+    /// Live-path tests share one capture server, so they assert on request
+    /// *position*. Hold this for the duration of each one: without it, a
+    /// concurrent test's request lands in between and the count is wrong.
+    static LIVE_PATH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the serialization lock, ignoring poisoning. A panic in one live test
+    /// should surface as that test's own failure, not as a `PoisonError`
+    /// cascade that hides it in every sibling.
+    pub(crate) fn live_path_guard() -> std::sync::MutexGuard<'static, ()> {
+        LIVE_PATH.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The capture server runs on its own thread with its own runtime and
+    /// returns its base URL alongside the request sink.
+    ///
+    /// Spawning it inside a `#[tokio::test]` looks fine and passes in isolation,
+    /// but that runtime is torn down when the test returns, killing the server
+    /// for every test that runs after it. A dedicated thread outlives the whole
+    /// test binary.
+    pub(crate) fn capture_server() -> (String, Captured) {
+        use axum::{extract::State as AxumState, routing::post, Json, Router};
+
+        static SERVER: std::sync::OnceLock<(String, Captured)> = std::sync::OnceLock::new();
+
+        SERVER
+            .get_or_init(|| {
+                let (tx, rx) = std::sync::mpsc::channel();
+
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                        .expect("capture-server runtime");
+
+                    rt.block_on(async move {
+                        async fn control(
+                            AxumState(captured): AxumState<Captured>,
+                            Json(body): Json<JsonValue>,
+                        ) -> Json<JsonValue> {
+                            let instance = body["payload"]["capability"]["instance"]
+                                .as_str()
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let value = body["payload"]["capability"]["value"].clone();
+                            captured
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(body);
+                            Json(serde_json::json!({
+                                "requestId": "test",
+                                "code": 200,
+                                "msg": "success",
+                                "capability": {
+                                    "type": "devices.capabilities.music_setting",
+                                    "instance": instance,
+                                    "value": value,
+                                    "state": {},
+                                },
+                            }))
+                        }
+
+                        let captured: Captured = Arc::new(Mutex::new(vec![]));
+                        let app = Router::new()
+                            .route("/router/api/v1/device/control", post(control))
+                            .with_state(captured.clone());
+
+                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                            .await
+                            .expect("bind capture server");
+                        let addr = listener.local_addr().expect("local addr");
+                        tx.send((addr, captured)).expect("hand back the address");
+
+                        axum::serve(listener, app).await.expect("serve");
+                    });
+                });
+
+                let (addr, captured) = rx.recv().expect("capture server started");
+                (format!("http://{addr}"), captured)
+            })
+            .clone()
+    }
+
+    pub(crate) fn music_device() -> HttpDeviceInfo {
+        let resp: GetDevicesResponse = from_json(&LIST_DEVICES_EXAMPLE2).unwrap();
+        resp.data
+            .iter()
+            .find(|d| d.capability_by_instance("musicMode").is_some())
+            .expect("fixture has a device with musicMode")
+            .clone()
+    }
+
+    fn live_music_path() -> (
+        std::sync::MutexGuard<'static, ()>,
+        Captured,
+        GoveeApiClient,
+        HttpDeviceInfo,
+        usize,
+    ) {
+        let serialized = live_path_guard();
+        let (base_url, captured) = capture_server();
+        let client = GoveeApiClient::new_for_test("test-key", base_url);
+        let device = music_device();
+        let before = captured.lock().unwrap_or_else(|e| e.into_inner()).len();
+        (serialized, captured, client, device, before)
+    }
+
+    #[tokio::test]
+    async fn music_effect_sends_the_stored_sensitivity_over_the_wire() {
+        let (_serialized, captured, client, device, before) = live_music_path();
+        client
+            .set_scene_by_name_with_music_settings(
+                &device,
+                "Music: Rhythm",
+                MusicModeSettings {
+                    sensitivity: 42,
+                    rgb: None,
+                },
+            )
+            .await
+            .expect("control_device succeeds against the capture server");
+
+        let sent = captured.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(sent.len(), before + 1, "exactly one request should be sent");
+        let cap = &sent[before]["payload"]["capability"];
+        assert_eq!(cap["instance"], "musicMode");
+        assert_eq!(cap["type"], "devices.capabilities.music_setting");
+        assert_eq!(
+            cap["value"]["sensitivity"], 42,
+            "the stored preference must reach the wire, not the old hardcoded 100"
+        );
+        assert_eq!(cap["value"]["autoColor"], 1);
+        assert!(!cap["value"]["musicMode"].is_null());
+    }
+
+    #[tokio::test]
+    async fn music_effect_clamps_over_range_sensitivity_on_the_wire() {
+        let (_serialized, captured, client, device, before) = live_music_path();
+        client
+            .set_scene_by_name_with_music_settings(
+                &device,
+                "Music: Rhythm",
+                MusicModeSettings {
+                    sensitivity: 250,
+                    rgb: None,
+                },
+            )
+            .await
+            .expect("control_device succeeds");
+
+        let sent = captured.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            sent[before]["payload"]["capability"]["value"]["sensitivity"], 100,
+            "out-of-range input must be clamped before it leaves the process"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_set_scene_by_name_still_sends_the_historical_default() {
+        let (_serialized, captured, client, device, before) = live_music_path();
+        client
+            .set_scene_by_name(&device, "Music: Rhythm")
+            .await
+            .expect("control_device succeeds");
+
+        let sent = captured.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            sent[before]["payload"]["capability"]["value"]["sensitivity"], 100,
+            "the CLI path must be byte-identical to the pre-preference behaviour"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_scene_never_reaches_the_wire() {
+        let (_serialized, captured, client, device, before) = live_music_path();
+        let err = client
+            .set_scene_by_name_with_music_settings(
+                &device,
+                "",
+                MusicModeSettings {
+                    sensitivity: 50,
+                    rgb: None,
+                },
+            )
+            .await
+            .expect_err("an empty scene must be refused");
+        assert!(format!("{err:#}").contains("no-scene"));
+        assert_eq!(
+            captured.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            before,
+            "a refused scene must send nothing"
+        );
     }
 }

@@ -1,0 +1,167 @@
+# Local verification log: #39 Step A Platform music settings + review-comment remediation
+# base: 67f5ae027790beb826a778344549566ee41a9d2b
+# source/config/docs diff SHA-256 (this proof log and TODOS.md excluded): 1249e24963eed06a2b7af1b13b3fd8df9f31f59e8da1a80ec7e3350e287608aa
+# That hash binds the LOCAL GATES below to the shipped source, and is stable
+# across the commit that adds this file. It does NOT bind the hardware run,
+# which was made at an earlier revision; see "Not covered here".
+# date: 2026-09-01 (gates re-run on the CI toolchain after review corrections)
+# host: macOS 26.5.1 (25F80), rustc 1.98.0 (88d9e12ae 2026-08-18)
+# live Govee account or hardware: H60B0 TESTED; LAN palette and deployed add-on NOT TESTED
+
+## Prescribed local gates
+
+### cargo build --all
+    Finished `dev` profile [unoptimized + debuginfo]
+BUILD: OK
+
+### cargo test --all -- --show-output
+test result: ok. 242 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.84s
+TESTS: OK
+
+### cargo test --all --all-features -- --show-output
+test result: ok. 243 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.84s
+ALL-FEATURE TESTS: OK (see "Known flake" below)
+
+### cargo clippy --all -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo]
+CLIPPY: OK
+
+### cargo clippy --all --all-features -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo]
+ALL-FEATURE CLIPPY: OK
+
+### cargo fmt --all -- --check
+FMT: OK (stable-toolchain warning for nightly-only imports_granularity only)
+
+### python3 -m unittest scripts/test_live_2fa.py
+Ran 22 tests in 0.029s
+PYTHON HARNESS: OK
+
+### cargo check --release
+    Finished `release` profile [optimized]
+RELEASE CHECK: OK
+
+### cargo check --all-targets
+    Finished `dev` profile [unoptimized + debuginfo]
+ALL-TARGET CHECK: OK
+
+### git diff --check origin/main
+DIFF CHECK: OK
+
+## Review-comment regression coverage
+
+- MQTT receipt enters a nonblocking FIFO scheduler before handler tasks spawn.
+- All 14 registered device-command route shapes resolve raw ids, topic-safe ids,
+  names, computed names, and IP aliases to one canonical per-device lane.
+- Invalid ids and global/custom discovery status topics do not retain device
+  workers; separate devices remain concurrent.
+- A synthetic handler panic is isolated and the next same-device command runs.
+  The focused test intentionally invokes Rust's panic hook while still passing.
+- Sensitivity followed by a Music effect reaches the loopback Platform capture
+  server with the new sensitivity in the effect payload.
+- Sensitivity notification and slider echoes use a per-device publication lock,
+  re-read canonical state after lock acquisition, and publish the newest value
+  last under a controlled stale-notify interleaving.
+- The read-after-lock guard passed 100/100 repetitions and failed when locally
+  mutated to snapshot state before acquiring the publication lock.
+- The slider stores under the device-control permit, then schedules its echo in
+  the background so MQTT broker I/O blocks neither the permit nor dispatch lane.
+- Detached echo failures are explicitly logged; synchronous entity-notification
+  publish failures continue to propagate to their caller.
+
+## Existing regression and wire coverage
+
+- Discovery publishes the 0..100 slider only for usable numeric musicMode
+  metadata; case variants and malformed/empty metadata remain covered.
+- Decimal values round, out-of-range values clamp, and NaN, infinity, overflow,
+  and non-numeric MQTT payloads fail explicitly.
+- Discovery and state echo share one topic constructor; exact topics, payloads,
+  reset behavior, and synchronous publish-error propagation are asserted.
+- Platform sensitivity, historical defaults, clamping, autoColor, and packed RGB
+  are asserted through payload builders and an in-process HTTP capture server.
+- A Music effect plus rgb_color disables autoColor on the wire; ordinary scenes
+  in the same command continue to ignore RGB.
+- Scene dispatch reads fresh canonical sensitivity and retains the detached-device
+  fallback without cloning full device/catalog state.
+
+## Add-on validation
+
+- PyYAML safe-loaded addon/config.yaml and addon/translations/en.yaml.
+- All 21 schema, translation, and bashio::config.has_value keys match.
+- music_palette maps bool? -> GOVEE_MUSIC_PALETTE -> the Rust reader.
+- bash -n addon/run.sh: OK; executable mode preserved.
+- No add-on files changed while addressing the review comments.
+
+## Known flake (pre-existing, not from this branch)
+
+One run of `cargo test --all --all-features` failed
+`service::device::test::lan_carry_over_preserves_iot_mode_observation_time`.
+It then passed in isolation and 15/15 in a serial rerun with no other cargo
+process on the box, so the failing assertion was never captured. Both the test
+and `Device::device_state()` are unchanged on this branch and present on
+`origin/main`. Suspected cause and the deterministic repro needed to confirm it
+are recorded in TODOS.md rather than guessed at here.
+
+Measurement note, because a review pass reported a much higher rate: several
+tests bind fixed ports (`lan_api.rs` uses 4002/4003, and its loopback scenarios
+are deliberately folded into ONE test "to avoid a bind race under the parallel
+harness"). That guard holds within a test binary but not across concurrent
+`cargo test` *processes*. A run of 15 taken while two other reviewers were also
+running the suite showed 7 failures, all `AddrInUse` on 4003; the same 15 run
+serially showed 0. Any flake rate quoted for this crate is only meaningful with
+nothing else building or testing at the same time.
+
+## Pre-merge review
+
+This diff was reviewed for concurrency correctness, test coverage, and doc
+accuracy, then again by the PR review bots. Nothing blocking. Corrections:
+
+- Fixed: the add-on wiring guard matched raw file text, so commenting out the
+  whole `music_palette` block in run.sh left it green. Ships with a
+  mutation-verified regression test.
+- Fixed: `has_music_mode_options` accepted any `i64` and the lookup then cast it
+  with `as u32`, so a `-1` in malformed capability metadata became 4294967295
+  and 4294967296 became 0. Discovery could publish an actionable slider that
+  sends a value Govee rejects. Both the predicate and both lookups now share one
+  checked conversion; boundaries are asserted at -1, 0, u32::MAX and u32::MAX+1.
+- Added: a Clear Music Sensitivity button. Once a value was stored there was no
+  way to unset it, which the withdrawn commit below was reaching for through the
+  wrong mechanism. The button is enumerated under the slider's guard, shares the
+  device's FIFO dispatch lane and update permit, and echoes the reset sentinel on
+  the state topic.
+- Withdrawn: an earlier commit in this branch claimed Home Assistant publishes
+  `payload_reset` to the *command* topic, and added a handler branch for it.
+  That premise was wrong. HA documents `payload_reset` as "a special payload
+  that resets the state to `unknown` when received on the `state_topic`" — it is
+  read on the state topic and never sent to the command topic. Publishing `None`
+  on the state topic, which this bridge already did, was correct as written. The
+  commit was reverted; a test that only proved the invented behaviour went with
+  it.
+
+Deferred with reasons in TODOS.md: no test asserts the MQTT router's route
+table (pre-existing, affects all 17 routes, needs a broker or a refactor), and
+`GOVEE_DISABLE_EFFECTS` can leave the slider live with no effect to apply to.
+
+## Not covered here
+
+An earlier revision of this diff was exercised with a real Govee account,
+an isolated Mosquitto broker, and a physical H60B0 light (device identifier
+redacted). Sensitivity 5 followed by `Music: Rhythm` reached the
+Platform API as 5 with code 200; sensitivity 95 followed by the same effect reached
+it as 95 with code 200. MQTT retained 95 as the final echo, and direct LAN plus
+Home Assistant state confirmed the lamp was restored to OFF. The user visually
+confirmed an aggressive music-reactive blink.
+
+That run was made at source hash `9c7471fd2579e92f1eb5c21409c5102d`
+`c2ba335487835a73362c77a75d0f072e`, which is NOT the hash at the top of this
+file. What landed after it: a test-only change to the add-on wiring guard, a
+checked integer conversion in the Platform API enum helpers, and the revert
+described above. None of them touch `parse_music_sensitivity` or the store path,
+so the numeric path the hardware run exercised (5 and 95) is behaviourally
+unchanged. The header hash binds the local gates, not this run.
+
+The reverse-engineered `set-music-palette` LAN command and a deployed Home
+Assistant add-on image were not exercised. The visible difference between
+sensitivity 5 and 95 was not quantified, so the physical claim is exact command
+transport plus visible music-mode reaction, not a measured animation-amplitude
+comparison.

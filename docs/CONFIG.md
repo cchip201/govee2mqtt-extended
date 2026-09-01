@@ -166,3 +166,75 @@ let you trim or disable the published effect list. They are environment-only
 
 `disable_effects` wins: if it is set, no effects are published regardless of
 `allowed_effects`.
+
+## Music Mode
+
+Music mode reacts to sound. Selecting a `Music: <Style>` effect on a light
+already works through the Platform API with no additional music-specific
+opt-in once the API key is configured.
+
+Programming music mode with **your own palette** is opt-in, because the frames
+are reverse-engineered and only mapped for a few SKUs. Turning it on enables the
+`gv2mqtt/<id>/set-music-palette` MQTT command topic, which sends the palette
+over the LAN API. See [Music mode](MUSIC_MODE.md) for the supported devices, the
+payload format, and how to map a new SKU.
+
+|CLI|ENV|App Config|Default|Purpose|
+|---|---|----------|-------|-------|
+|*(none)*|`GOVEE_MUSIC_PALETTE=true`|`music_palette`|*(off)*|Enable the `set-music-palette` command topic. Requires LAN control for the device.|
+
+Sensitivity is separate. The **Music Sensitivity** number entity stores the value
+used the next time you select a `Music:` effect; it is not sent on its own,
+because Govee rejects a `music_setting` call that omits the style, and sending
+the style would switch the light into music mode (and power it on) as a side
+effect of moving a slider.
+
+The value is held in memory. After a Govee2MQTT restart the entity reads as
+unknown until you set it again, and a `Music:` effect selected in the meantime
+uses the default of 100. Govee offers no way to read the current sensitivity
+back from a light, so the bridge cannot recover it.
+
+A **Clear Music Sensitivity** button ships alongside the slider and forgets the
+stored value, putting the entity back to unknown and the next `Music:` effect
+back on the default. It is a button rather than something you write to the
+slider because Home Assistant reads a number's `payload_reset` on the state
+topic and never publishes it to the command topic, so a number entity on its own
+offers no way back to unknown.
+
+The Platform API also accepts one fixed music colour. Send it together with the
+effect through Home Assistant's normal light service:
+
+```yaml
+service: light.turn_on
+target:
+  entity_id: light.your_govee
+data:
+  effect: "Music: Rhythm"
+  rgb_color: [18, 52, 86]
+```
+
+With `rgb_color`, the bridge sends `autoColor: 0` plus the packed RGB value.
+Without it, the bridge preserves the historical `autoColor: 1`, so the device
+chooses colours. The Platform API supports only this one colour, not a palette.
+
+Note that Home Assistant can supply `rgb_color` without you asking for it.
+Restoring a scene, or any script that replays a light's captured attributes,
+sends the whole attribute set — so a snapshot taken while the light was in a
+`Music:` effect replays `effect` *and* `rgb_color` together, which pins the
+colour and stops the automatic cycling. Ordinary (non-`Music:`) scenes ignore
+colour in the same command, exactly as before. To restore a cycling music
+effect, send `effect` on its own.
+
+### MQTT topics
+
+The number entity is the supported interface; these are the topics behind it,
+for driving the bridge directly over MQTT rather than through Home Assistant.
+
+|Topic|Direction|Payload|
+|-----|---------|-------|
+|`gv2mqtt/<id>/set-music-sensitivity`|command|`0`-`100`. Decimals round, out-of-range values clamp.|
+|`gv2mqtt/<id>/clear-music-sensitivity`|command|Any payload. Forgets the stored value; the next `Music:` effect uses the default of 100.|
+|`gv2mqtt/<id>/notify-music-sensitivity`|state|The stored value, or `None` when nothing has been set yet. `None` is the entity's `payload_reset`, which Home Assistant reads on this topic to show the number as unknown.|
+
+The LAN palette frames carry their own sensitivity byte, which is a different
+setting from the Platform API one the number entity writes.
