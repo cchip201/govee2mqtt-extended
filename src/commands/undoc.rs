@@ -15,6 +15,19 @@ enum SubCommand {
     OneClick {
         name: String,
     },
+    /// Dump the account API device list as redacted raw JSON.
+    ///
+    /// This is the capture path for devices the Platform API does not
+    /// return (eg: H7180, <https://github.com/wez/govee2mqtt/issues/173>):
+    /// the typed parse drops fields it does not model, so this prints the
+    /// raw response instead, with embedded JSON strings expanded for
+    /// readability and known-sensitive values (IoT topic, secret code,
+    /// tokens) redacted.
+    DumpDevices {
+        /// Only show devices with this SKU (eg: H7180)
+        #[arg(long)]
+        sku: Option<String>,
+    },
     /// Test-only login probe. Emits only a redacted, machine-readable outcome.
     ///
     /// The name is pinned rather than derived. scripts/live_2fa.py invokes it
@@ -40,6 +53,22 @@ impl UndocCommand {
                 let client = args.undoc_args.api_client()?;
                 let items = client.parse_one_clicks().await?;
                 println!("{items:#?}");
+            }
+            SubCommand::DumpDevices { sku } => {
+                let client = args.undoc_args.api_client()?;
+                let acct = client.login_account_cached().await?;
+                let mut raw = client.get_device_list_raw(&acct.token).await?;
+                crate::undoc_api::redact_device_list_json(&mut raw);
+
+                if let Some(sku) = sku {
+                    if let Some(devices) = raw.get_mut("devices").and_then(|d| d.as_array_mut()) {
+                        devices.retain(|device| {
+                            device.get("sku").and_then(|s| s.as_str()) == Some(sku.as_str())
+                        });
+                    }
+                }
+
+                println!("{}", serde_json::to_string_pretty(&raw)?);
             }
             SubCommand::OneClick { name } => {
                 let client = args.undoc_args.api_client()?;

@@ -914,8 +914,8 @@ impl GoveeUndocumentedApi {
         Ok(value.into_inner())
     }
 
-    pub async fn get_device_list(&self, token: &str) -> anyhow::Result<DevicesResponse> {
-        let response = reqwest::Client::builder()
+    fn device_list_request(&self, token: &str) -> anyhow::Result<reqwest::RequestBuilder> {
+        Ok(reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?
             .request(
@@ -928,15 +928,37 @@ impl GoveeUndocumentedApi {
             .header("clientType", "1")
             .header("iotVersion", "0")
             .header("timestamp", ms_timestamp())
-            .header("User-Agent", user_agent())
-            .send()
-            .await?;
+            .header("User-Agent", user_agent()))
+    }
+
+    pub async fn get_device_list(&self, token: &str) -> anyhow::Result<DevicesResponse> {
+        let response = self.device_list_request(token)?.send().await?;
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             self.invalidate_account_login();
         }
 
         let resp: DevicesResponse = http_response_body(response).await?;
+
+        Ok(resp)
+    }
+
+    /// Fetches the account device list as raw JSON instead of the typed
+    /// `DevicesResponse`. The typed structs silently drop fields they do
+    /// not model (in release builds), which is exactly the data needed
+    /// when capturing metadata for an unsupported device, eg:
+    /// <https://github.com/wez/govee2mqtt/issues/173>.
+    ///
+    /// Callers must pass the result through `redact_device_list_json`
+    /// before logging or printing it.
+    pub async fn get_device_list_raw(&self, token: &str) -> anyhow::Result<JsonValue> {
+        let response = self.device_list_request(token)?.send().await?;
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.invalidate_account_login();
+        }
+
+        let resp: JsonValue = http_response_body(response).await?;
 
         Ok(resp)
     }
@@ -1586,6 +1608,45 @@ fn embedded_json_with_policy<'de, T: DeserializeOwned, D: serde::de::Deserialize
             std::any::type_name::<T>()
         ))
     })
+}
+
+/// Keys in the account device list whose values grant control of, or
+/// identify, the account's AWS IoT channel. Kept in sync with the fields
+/// wrapped in `Redacted<..>` on the typed structs above.
+const REDACTED_DEVICE_LIST_KEYS: &[&str] = &["topic", "secretCode", "token", "accountTopic"];
+
+/// Redacts sensitive values in a raw device list JSON document, in place,
+/// so that `get_device_list_raw` output is safe to print or attach to a
+/// GitHub issue. Embedded-JSON string fields (eg: `deviceExt.deviceSettings`)
+/// are expanded to objects so the redaction reaches inside them; strings
+/// that do not themselves encode a JSON object or array are left untouched.
+pub fn redact_device_list_json(value: &mut JsonValue) {
+    match value {
+        JsonValue::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if REDACTED_DEVICE_LIST_KEYS.contains(&key.as_str()) {
+                    *child = JsonValue::String("<redacted>".to_string());
+                    continue;
+                }
+                if let JsonValue::String(s) = child {
+                    if let Ok(mut embedded) = serde_json::from_str::<JsonValue>(s) {
+                        if embedded.is_object() || embedded.is_array() {
+                            redact_device_list_json(&mut embedded);
+                            *child = embedded;
+                            continue;
+                        }
+                    }
+                }
+                redact_device_list_json(child);
+            }
+        }
+        JsonValue::Array(items) => {
+            for item in items {
+                redact_device_list_json(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -2780,5 +2841,57 @@ mod test {
             body["code"], "111222",
             "whitespace from email paste must be normalized end-to-end"
         );
+    }
+
+    /// Shaped like the H7180 account API entry captured in
+    /// <https://github.com/homebridge-plugins/homebridge-govee/issues/684>:
+    /// `deviceSettings` is JSON embedded in a string, with the IoT topic
+    /// and secret code inside it. The unknown `cookMode` field stands in
+    /// for the cooker-specific fields the typed parse would drop — they
+    /// are the whole point of the raw dump and must survive redaction.
+    #[test]
+    fn device_list_redaction_reaches_embedded_json_and_keeps_unknown_fields() {
+        let mut value = json!({
+            "devices": [{
+                "sku": "H7180",
+                "goodsType": 152,
+                "deviceExt": {
+                    "deviceSettings":
+                        "{\"topic\":\"GD/abc123\",\"secretCode\":\"sekrit\",\
+                         \"cookMode\":3,\"versionSoft\":\"1.00.17\"}",
+                    "lastDeviceData": "{\"online\":false}"
+                }
+            }]
+        });
+
+        redact_device_list_json(&mut value);
+
+        let settings = &value["devices"][0]["deviceExt"]["deviceSettings"];
+        assert_eq!(settings["topic"], "<redacted>");
+        assert_eq!(settings["secretCode"], "<redacted>");
+        assert_eq!(settings["cookMode"], 3);
+        assert_eq!(settings["versionSoft"], "1.00.17");
+        assert_eq!(
+            value["devices"][0]["deviceExt"]["lastDeviceData"]["online"],
+            false
+        );
+    }
+
+    /// Only strings encoding a JSON object or array are expanded: version
+    /// strings and numeric-looking strings must come through verbatim, or
+    /// the dump would misrepresent what Govee actually sent.
+    #[test]
+    fn device_list_redaction_does_not_mangle_scalar_strings() {
+        let mut value = json!({
+            "versionHard": "1.02.00",
+            "spec": "152",
+            "message": "null"
+        });
+
+        redact_device_list_json(&mut value);
+
+        assert_eq!(value["versionHard"], "1.02.00");
+        assert_eq!(value["spec"], "152");
+        assert_eq!(value["message"], "null");
     }
 }
