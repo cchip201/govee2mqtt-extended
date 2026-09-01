@@ -279,6 +279,22 @@ fn load_quirks() -> HashMap<String, Quirk> {
         Quirk::device("H7173", DeviceType::Kettle, "mdi:kettle")
             .with_platform_temperature_sensor_units(TemperatureUnits::Fahrenheit)
             .with_show_as_preset_modes(&["Tea", "Coffee", "DIY"]),
+        // GoveeLife Smart Rice Cooker Pro. Only the undocumented account
+        // API returns this device; Govee's documented Platform API does
+        // not list H7180, so there is no capability metadata to map
+        // controls from. Registering its identity stops the "Unknown
+        // device type. Cannot map to Home Assistant." warning and the
+        // default-to-Light fallback; `DeviceType::Other` also opts it out
+        // of Platform API polling, which cannot work for this device.
+        // No controls are declared: no public capability data exists yet.
+        // Evidence: <https://github.com/wez/govee2mqtt/issues/173>, and
+        // the captured account API entry in
+        // <https://github.com/homebridge-plugins/homebridge-govee/issues/684>.
+        Quirk::device(
+            "H7180",
+            DeviceType::Other("devices.types.rice_cooker".to_string()),
+            "mdi:rice",
+        ),
         // Lights from the list of LAN API enabled devices
         // at <https://app-h5.govee.com/user-manual/wlan-guide>
         Quirk::lan_api_capable_light("H6072", FLOOR_LAMP),
@@ -364,5 +380,29 @@ mod test {
         assert_eq!(quirk.device_type, DeviceType::Light);
         assert_eq!(quirk.icon.as_ref(), FLOOR_LAMP);
         assert!(quirk.lan_api_capable);
+    }
+
+    /// <https://github.com/wez/govee2mqtt/issues/173>: the H7180 is
+    /// account-API-only, so its quirk must claim nothing beyond its
+    /// identity. Every capability assertion here is deliberate: there
+    /// is no public evidence for any control, and a `true` sneaking in
+    /// would fabricate one.
+    #[test]
+    fn h7180_is_a_recognized_rice_cooker_with_no_fabricated_controls() {
+        let Some(quirk) = resolve_quirk("H7180") else {
+            panic!("H7180 quirk must be registered");
+        };
+
+        assert_eq!(
+            quirk.device_type,
+            DeviceType::Other("devices.types.rice_cooker".to_string())
+        );
+        assert!(!quirk.supports_rgb);
+        assert!(!quirk.supports_brightness);
+        assert!(quirk.color_temp_range.is_none());
+        assert!(!quirk.lan_api_capable);
+        assert!(!quirk.ble_only);
+        assert!(!quirk.iot_api_supported);
+        assert!(quirk.show_as_preset_buttons.is_none());
     }
 }
