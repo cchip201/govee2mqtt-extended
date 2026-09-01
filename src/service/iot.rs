@@ -438,6 +438,15 @@ fn merge_iot_packet(device: &mut Device, sku: &str, packet: &Packet) {
                 GoveeBlePacket::NotifyHumidifierMode(NotifyHumidifierMode { mode, param }) => {
                     device.set_humidifier_work_mode_and_param(mode, param);
                 }
+                GoveeBlePacket::NotifyRiceCookerActiveProgram(rc) => {
+                    device.set_rice_cooker_program(rc.program);
+                }
+                GoveeBlePacket::NotifyRiceCookerProgramPhase(rc) => {
+                    device.set_rice_cooker_program_phase(rc.program, rc.phase);
+                }
+                GoveeBlePacket::NotifyRiceCookerProgramParams(rc) => {
+                    device.set_rice_cooker_params(rc);
+                }
                 GoveeBlePacket::Generic(_) => {
                     // Ignore packets that we can't decode
                 }
@@ -609,5 +618,120 @@ mod test {
         let state = device.device_state().expect("device state");
         assert_eq!(state.mode, Some(5));
         assert_eq!(state.mode_updated, Some(observed));
+    }
+
+    /// Verbatim H7180 `multiSync` push from the 2026-09-01 capture
+    /// (wez/govee2mqtt#173), 07:10:32: program 3 was started from the
+    /// Govee app with a 113.00°F (45°C) set temperature. Only the
+    /// device id and transaction are anonymized; the frames are real.
+    const H7180_PROGRAM_3_MULTISYNC: &str = r#"{
+        "proType": 2,
+        "sku": "H7180",
+        "device": "16:03:AA:BB:CC:DD:EE:FF",
+        "softVersion": "1.00.23",
+        "wifiSoftVersion": "1.00.23",
+        "cmd": "multiSync",
+        "type": 0,
+        "transaction": "u_0",
+        "pactType": 2,
+        "pactCode": 1,
+        "state": {"result": 1},
+        "op": {"command": [
+            "qgUAAwAAAAAAAAAAAAAAAAAAAKw=",
+            "qgUDAEYAAAEsJALQAQAAAAABADE=",
+            "qhkDAQAAAAAAAAAAAAAAAAAAALE="
+        ]}
+    }"#;
+
+    #[test]
+    fn rice_cooker_multisync_populates_program_state() {
+        let mut device = Device::new("H7180", "16:03:AA:BB:CC:DD:EE:FF");
+
+        let packet: Packet = serde_json::from_str(H7180_PROGRAM_3_MULTISYNC).unwrap();
+        merge_iot_packet(&mut device, "H7180", &packet);
+
+        assert_eq!(device.rice_cooker_program, Some(3));
+        assert_eq!(device.rice_cooker_phase, Some(1));
+        let params = device.rice_cooker_params.expect("program params decoded");
+        assert_eq!(params.program, 3);
+        assert_eq!(params.set_temperature_centi_fahrenheit(), Some(11300));
+    }
+
+    /// Verbatim idle `cmd:"status"` reply from the same capture
+    /// (07:09:35): nine report frames, most of which are still
+    /// undecoded families — they must merge without effect while the
+    /// program/phase frames land, and `onOff:0` must flow through.
+    #[test]
+    fn rice_cooker_idle_status_reports_standby() {
+        let payload = r#"{
+            "proType": 2,
+            "sku": "H7180",
+            "device": "16:03:AA:BB:CC:DD:EE:FF",
+            "softVersion": "1.00.23",
+            "wifiSoftVersion": "1.00.23",
+            "cmd": "status",
+            "type": 0,
+            "transaction": "x_0",
+            "pactType": 2,
+            "pactCode": 1,
+            "state": {"onOff": 0, "sta": {"stc": "19_0_55_669620"}, "result": 1},
+            "op": {"command": [
+                "qhcAAAAAAAAAAAAAAAAAAAAAAL0=",
+                "qgUAAAAAAAAAAAAAAAAAAAAAAK8=",
+                "qgUAAAAAAAAAAAAAAAAAAAAAAK8=",
+                "qhkAAAAAAAAAAAAAAAAAAAAAALM=",
+                "qhYA/////wEAAAAAAAAAAAAAAL0=",
+                "qiIAMywC0AAAAAAAAAAAAAAAAEU=",
+                "qiMAAAABAAAAAAAAAAAAAAAAAIg=",
+                "qiQAAAAAAAAAAAAAAAAAAAAAAI4=",
+                "qiUAAAAAAAAAAAAAAAAAAAAAAI8="
+            ]}
+        }"#;
+        let mut device = Device::new("H7180", "16:03:AA:BB:CC:DD:EE:FF");
+
+        let packet: Packet = serde_json::from_str(payload).unwrap();
+        merge_iot_packet(&mut device, "H7180", &packet);
+
+        assert_eq!(device.rice_cooker_program, Some(0));
+        assert_eq!(device.rice_cooker_phase, Some(0));
+        assert!(device.rice_cooker_params.is_none());
+        let status = device.iot_device_status.as_ref().expect("status cached");
+        assert!(!status.on);
+    }
+
+    /// Stop sequence (07:09:39 burst): after a program was active, a
+    /// standby push must reset both program and phase.
+    #[test]
+    fn rice_cooker_standby_push_clears_active_program() {
+        let mut device = Device::new("H7180", "16:03:AA:BB:CC:DD:EE:FF");
+
+        let running: Packet = serde_json::from_str(H7180_PROGRAM_3_MULTISYNC).unwrap();
+        merge_iot_packet(&mut device, "H7180", &running);
+
+        let standby = r#"{
+            "proType": 2,
+            "sku": "H7180",
+            "device": "16:03:AA:BB:CC:DD:EE:FF",
+            "softVersion": "1.00.23",
+            "wifiSoftVersion": "1.00.23",
+            "cmd": "multiSync",
+            "type": 0,
+            "transaction": "u_1",
+            "pactType": 2,
+            "pactCode": 1,
+            "state": {"result": 1},
+            "op": {"command": [
+                "qhkAAAAAAAAAAAAAAAAAAAAAALM=",
+                "qgUAAAAAAAAAAAAAAAAAAAAAAK8="
+            ]}
+        }"#;
+        let packet: Packet = serde_json::from_str(standby).unwrap();
+        merge_iot_packet(&mut device, "H7180", &packet);
+
+        assert_eq!(device.rice_cooker_program, Some(0));
+        assert_eq!(device.rice_cooker_phase, Some(0));
+        // The last program's parameter block remains as a residual
+        // report, exactly as the device itself keeps sending it.
+        assert!(device.rice_cooker_params.is_some());
     }
 }

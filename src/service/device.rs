@@ -1,4 +1,4 @@
-use crate::ble::NotifyHumidifierNightlightParams;
+use crate::ble::{NotifyHumidifierNightlightParams, NotifyRiceCookerProgramParams};
 use crate::commands::serve::POLL_INTERVAL;
 use crate::lan_api::{DeviceColor, DeviceStatus as LanDeviceStatus, LanDevice};
 use crate::platform_api::{
@@ -48,6 +48,13 @@ pub struct Device {
     pub target_humidity_percent: Option<u8>,
     pub humidifier_work_mode: Option<u8>,
     pub humidifier_param_by_mode: HashMap<u8, u8>,
+
+    /// Rice cooker (H7180) state decoded from its account-topic
+    /// multiSync reports; see the rice cooker codecs in ble.rs.
+    /// `rice_cooker_program` is `Some(0)` in standby.
+    pub rice_cooker_program: Option<u8>,
+    pub rice_cooker_phase: Option<u8>,
+    pub rice_cooker_params: Option<NotifyRiceCookerProgramParams>,
 
     pub last_polled: Option<DateTime<Utc>>,
 
@@ -213,6 +220,24 @@ impl Device {
 
     pub fn set_target_humidity(&mut self, percent: u8) {
         self.target_humidity_percent.replace(percent);
+    }
+
+    pub fn set_rice_cooker_program(&mut self, program: u8) {
+        if self.rice_cooker_program != Some(program) {
+            // A program change invalidates the phase until the next
+            // AA 19 report for the new program arrives.
+            self.rice_cooker_phase = None;
+        }
+        self.rice_cooker_program.replace(program);
+    }
+
+    pub fn set_rice_cooker_program_phase(&mut self, program: u8, phase: u8) {
+        self.rice_cooker_program.replace(program);
+        self.rice_cooker_phase.replace(phase);
+    }
+
+    pub fn set_rice_cooker_params(&mut self, params: NotifyRiceCookerProgramParams) {
+        self.rice_cooker_params.replace(params);
     }
 
     pub fn set_humidifier_work_mode_and_param(&mut self, mode: u8, param: u8) {

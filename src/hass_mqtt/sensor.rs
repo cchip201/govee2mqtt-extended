@@ -463,3 +463,168 @@ impl EntityInstance for SceneInfoSensor {
         Ok(())
     }
 }
+
+/// The rice cooker's active program, decoded from the `AA 05 00` /
+/// `AA 19` report frames on the account IoT topic (see the rice
+/// cooker codecs in ble.rs for the capture evidence). Program ids are
+/// numeric on purpose: which physical cooking function each id maps
+/// to is not yet known, and naming them would be a guess. The raw
+/// parameter block rides along as attributes so protocol work can
+/// continue from live state.
+pub struct RiceCookerProgramSensor {
+    sensor: SensorConfig,
+    device_id: String,
+    state: StateHandle,
+}
+
+impl RiceCookerProgramSensor {
+    pub fn new(device: &ServiceDevice, state: &StateHandle) -> Self {
+        let unique_id = format!(
+            "sensor-{id}-gv2mqtt-cooker-program",
+            id = topic_safe_id(device)
+        );
+
+        Self {
+            sensor: SensorConfig {
+                base: EntityConfig {
+                    availability_topic: availability_topic(),
+                    name: Some("Program".to_string()),
+                    entity_category: None,
+                    origin: Origin::default(),
+                    device: Device::for_device(device),
+                    unique_id: unique_id.clone(),
+                    device_class: None,
+                    icon: Some("mdi:pot-steam".to_string()),
+                },
+                state_topic: format!("gv2mqtt/sensor/{unique_id}/state"),
+                state_class: None,
+                json_attributes_topic: Some(format!("gv2mqtt/sensor/{unique_id}/attributes")),
+                unit_of_measurement: None,
+            },
+            device_id: device.id.to_string(),
+            state: state.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl EntityInstance for RiceCookerProgramSensor {
+    async fn publish_config(&self, state: &StateHandle, client: &HassClient) -> anyhow::Result<()> {
+        self.sensor.publish(state, client).await
+    }
+
+    async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
+        let Some(device) = self.state.device_by_id(&self.device_id).await else {
+            log::warn!(
+                "Device {} not found in state, skipping notify",
+                self.device_id
+            );
+            return Ok(());
+        };
+
+        let value = match device.rice_cooker_program {
+            None => "".to_string(),
+            Some(0) => "Standby".to_string(),
+            Some(n) => format!("Program {n}"),
+        };
+
+        let params_hex = device.rice_cooker_params.as_ref().map(|p| {
+            p.params
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        let attributes = json!({
+            "program": device.rice_cooker_program,
+            "phase": device.rice_cooker_phase,
+            "params_program": device.rice_cooker_params.as_ref().map(|p| p.program),
+            "params_hex": params_hex,
+            "set_temperature_centi_fahrenheit": device
+                .rice_cooker_params
+                .as_ref()
+                .and_then(|p| p.set_temperature_centi_fahrenheit()),
+        });
+
+        self.sensor.notify_state(client, &value).await?;
+        if let Some(topic) = &self.sensor.json_attributes_topic {
+            client.publish_obj(topic, attributes).await?;
+        }
+        Ok(())
+    }
+}
+
+/// The set temperature of the rice cooker's current (or most recent)
+/// program. The device reports hundredths of a degree Fahrenheit;
+/// this converts to the service's configured temperature scale, the
+/// same way the Platform API temperature sensors do.
+pub struct RiceCookerSetTemperatureSensor {
+    sensor: SensorConfig,
+    device_id: String,
+    state: StateHandle,
+}
+
+impl RiceCookerSetTemperatureSensor {
+    pub async fn new(device: &ServiceDevice, state: &StateHandle) -> Self {
+        let unique_id = format!(
+            "sensor-{id}-gv2mqtt-cooker-set-temperature",
+            id = topic_safe_id(device)
+        );
+
+        Self {
+            sensor: SensorConfig {
+                base: EntityConfig {
+                    availability_topic: availability_topic(),
+                    name: Some("Set Temperature".to_string()),
+                    entity_category: None,
+                    origin: Origin::default(),
+                    device: Device::for_device(device),
+                    unique_id: unique_id.clone(),
+                    device_class: Some(DEVICE_CLASS_TEMPERATURE),
+                    icon: None,
+                },
+                state_topic: format!("gv2mqtt/sensor/{unique_id}/state"),
+                state_class: Some(StateClass::Measurement),
+                json_attributes_topic: None,
+                unit_of_measurement: Some(
+                    state.get_temperature_scale().await.unit_of_measurement(),
+                ),
+            },
+            device_id: device.id.to_string(),
+            state: state.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl EntityInstance for RiceCookerSetTemperatureSensor {
+    async fn publish_config(&self, state: &StateHandle, client: &HassClient) -> anyhow::Result<()> {
+        self.sensor.publish(state, client).await
+    }
+
+    async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
+        let Some(device) = self.state.device_by_id(&self.device_id).await else {
+            log::warn!(
+                "Device {} not found in state, skipping notify",
+                self.device_id
+            );
+            return Ok(());
+        };
+
+        let value = match device
+            .rice_cooker_params
+            .as_ref()
+            .and_then(|p| p.set_temperature_centi_fahrenheit())
+        {
+            Some(centi_f) => {
+                let temperature =
+                    TemperatureValue::new(f64::from(centi_f) / 100.0, TemperatureUnits::Fahrenheit);
+                let scale = self.state.get_temperature_scale().await;
+                format!("{:.2}", temperature.as_unit(scale.into()).value())
+            }
+            None => "".to_string(),
+        };
+
+        self.sensor.notify_state(client, &value).await
+    }
+}

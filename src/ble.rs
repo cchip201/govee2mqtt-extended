@@ -224,6 +224,25 @@ impl PacketManager {
             g,
             b,
         ));
+        // H7180 rice cooker report frames. Decode-only: the write
+        // direction has never been captured, so no encoder exists and
+        // none is fabricated. See the type docs for the evidence trail.
+        all_codecs.push(PacketCodec::new(
+            &["H7180"],
+            NotifyRiceCookerActiveProgram::encode,
+            NotifyRiceCookerActiveProgram::decode,
+        ));
+        all_codecs.push(PacketCodec::new(
+            &["H7180"],
+            NotifyRiceCookerProgramPhase::encode,
+            NotifyRiceCookerProgramPhase::decode,
+        ));
+        all_codecs.push(PacketCodec::new(
+            &["H7180"],
+            NotifyRiceCookerProgramParams::encode,
+            NotifyRiceCookerProgramParams::decode,
+        ));
+
         all_codecs.push(PacketCodec::new(
             &["Generic:Light"],
             SetSceneCode::encode,
@@ -508,6 +527,146 @@ pub struct SetDevicePower {
     pub on: bool,
 }
 
+/// Validate a 20-byte `0xaa`-prefixed rice cooker report frame and
+/// return its body (everything between the `0xaa` marker and the
+/// trailing checksum). The final byte is an XOR of the preceding 19;
+/// that held for every one of the 201 `0xaa` frames in the 2026-09-01
+/// H7180/H717A/H7102 account-topic capture, so a mismatch here means
+/// the frame is not something we understand and it falls through to
+/// [`GoveeBlePacket::Generic`].
+fn rice_cooker_report_body(data: &[u8]) -> anyhow::Result<&[u8]> {
+    anyhow::ensure!(data.len() == 20, "rice cooker reports are 20 bytes");
+    anyhow::ensure!(data[0] == 0xaa, "not an 0xaa report frame");
+    anyhow::ensure!(
+        calculate_checksum(&data[..19]) == data[19],
+        "xor checksum mismatch"
+    );
+    Ok(&data[1..19])
+}
+
+/// `AA 05 00 <program>` from the H7180 rice cooker: the currently
+/// active program slot, `0` when the cooker is in standby. Observed
+/// live on 2026-09-01 (wez/govee2mqtt#173): the value moved
+/// `0 -> 1 -> 0 -> 4 -> 0 -> 3 -> 0` in lockstep with programs being
+/// started and stopped from the Govee app, and every `AA 19` frame in
+/// the same bursts mirrored the same id. The same `aa 05 00` family
+/// carries the active mode/slot on the H7160 humidifier and the
+/// H7171/H717A kettles (homebridge-govee `kettle.js` function `0500`).
+/// Which physical cooking function each id maps to is not yet known,
+/// so no names are assigned anywhere.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct NotifyRiceCookerActiveProgram {
+    pub program: u8,
+}
+
+impl NotifyRiceCookerActiveProgram {
+    fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("NotifyRiceCookerActiveProgram is a device report; no encoder");
+    }
+
+    fn decode(data: &[u8]) -> anyhow::Result<GoveeBlePacket> {
+        let body = rice_cooker_report_body(data)?;
+        anyhow::ensure!(
+            body[0] == 0x05 && body[1] == 0x00,
+            "not an active-program frame"
+        );
+        anyhow::ensure!(
+            body[3..].iter().all(|&b| b == 0),
+            "unexpected trailing data"
+        );
+        Ok(GoveeBlePacket::NotifyRiceCookerActiveProgram(Self {
+            program: body[2],
+        }))
+    }
+}
+
+/// `AA 19 <program> <phase>` from the H7180 rice cooker. In the
+/// 2026-09-01 capture `<program>` always matched the id in the
+/// `AA 05 00` frame of the same burst (including `3`, which does not
+/// exist in the kettle dialect, where `aa 19` byte 2 is a heating
+/// state instead — the cooker evidently repurposed the family).
+/// `<phase>` was `2` while program 1 ran and `1` for programs 3/4;
+/// its meaning is unconfirmed, so it is surfaced only as a raw
+/// diagnostic attribute.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct NotifyRiceCookerProgramPhase {
+    pub program: u8,
+    pub phase: u8,
+}
+
+impl NotifyRiceCookerProgramPhase {
+    fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("NotifyRiceCookerProgramPhase is a device report; no encoder");
+    }
+
+    fn decode(data: &[u8]) -> anyhow::Result<GoveeBlePacket> {
+        let body = rice_cooker_report_body(data)?;
+        anyhow::ensure!(body[0] == 0x19, "not a program-phase frame");
+        anyhow::ensure!(
+            body[3..].iter().all(|&b| b == 0),
+            "unexpected trailing data"
+        );
+        Ok(GoveeBlePacket::NotifyRiceCookerProgramPhase(Self {
+            program: body[1],
+            phase: body[2],
+        }))
+    }
+}
+
+/// `AA 05 <program != 0> <params...>` from the H7180 rice cooker: the
+/// parameter block of a program. The layout is program-specific, but
+/// every program observed on 2026-09-01 carried the block
+/// `01 <temp:u16be> 02 D0` at a fixed per-program offset, where
+/// `<temp>` is hundredths of a degree Fahrenheit — the same scaling
+/// homebridge-govee documents for the kettle family ("two bytes of
+/// hundredths of a degree fahrenheit") and the same capture's H717A
+/// `aa 10 01 1C 84` = 73.00°F corroborates. The captured cooker values
+/// were 13100/14900/11300 centi-°F = 131/149/113°F = exactly 55/65/45°C,
+/// moving only when a temperature was changed in the Govee app, so this
+/// is read as a set-point, not a probe reading. `0x02D0` (720, presumed
+/// minutes = 12h) never varied and is not decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotifyRiceCookerProgramParams {
+    pub program: u8,
+    /// Raw parameter bytes (frame bytes 3..=18), preserved so the
+    /// undecoded remainder stays visible for protocol work.
+    pub params: [u8; 16],
+}
+
+impl NotifyRiceCookerProgramParams {
+    fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("NotifyRiceCookerProgramParams is a device report; no encoder");
+    }
+
+    fn decode(data: &[u8]) -> anyhow::Result<GoveeBlePacket> {
+        let body = rice_cooker_report_body(data)?;
+        anyhow::ensure!(body[0] == 0x05, "not a program frame");
+        anyhow::ensure!(body[1] != 0x00, "program 0 is the active-program frame");
+        let mut params = [0u8; 16];
+        params.copy_from_slice(&body[2..]);
+        Ok(GoveeBlePacket::NotifyRiceCookerProgramParams(Self {
+            program: body[1],
+            params,
+        }))
+    }
+
+    /// The program's set temperature in hundredths of a degree
+    /// Fahrenheit, for the program layouts confirmed by the 2026-09-01
+    /// capture. Unknown program ids return `None` rather than guessing
+    /// an offset. The plausibility window is the one homebridge-govee
+    /// applies to kettle temperatures (32.00°F..=230.00°F).
+    pub fn set_temperature_centi_fahrenheit(&self) -> Option<u16> {
+        let idx = match self.program {
+            1 => 4,
+            3 => 5,
+            4 => 6,
+            _ => return None,
+        };
+        let value = u16::from_be_bytes([self.params[idx], self.params[idx + 1]]);
+        (3200..=23000).contains(&value).then_some(value)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GoveeBlePacket {
     Generic(HexBytes),
@@ -519,6 +678,9 @@ pub enum GoveeBlePacket {
     SetHumidifierMode(SetHumidifierMode),
     NotifyHumidifierAutoMode(HumidifierAutoMode),
     NotifyHumidifierNightlight(NotifyHumidifierNightlightParams),
+    NotifyRiceCookerActiveProgram(NotifyRiceCookerActiveProgram),
+    NotifyRiceCookerProgramPhase(NotifyRiceCookerProgramPhase),
+    NotifyRiceCookerProgramParams(NotifyRiceCookerProgramParams),
 }
 
 #[derive(Debug)]
@@ -797,5 +959,190 @@ a3 ff 05 0a 0f 06 0c 12 07 0e 15 00 00 00 00 00 00 00 00 58
         let encoded = Base64HexBytes::encode_for_sku("Generic:Light", &command).unwrap();
         // Three 20-byte frames, base64() splits them per frame for ptReal
         assert_eq!(encoded.base64().len(), 3);
+    }
+
+    /// Every fixture below is a verbatim frame from the 2026-09-01
+    /// H7180 account-topic capture (wez/govee2mqtt#173); nothing is
+    /// synthesized. Comments give the burst context.
+    mod rice_cooker {
+        use super::*;
+
+        fn decode(frame: &[u8; 20]) -> GoveeBlePacket {
+            MGR.decode_for_sku("H7180", frame)
+        }
+
+        fn active(program: u8) -> GoveeBlePacket {
+            GoveeBlePacket::NotifyRiceCookerActiveProgram(NotifyRiceCookerActiveProgram { program })
+        }
+
+        // 07:09:35 status burst: cooker idle.
+        const IDLE: [u8; 20] = [
+            0xAA, 0x05, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAF,
+        ];
+        // 07:09:46 / 07:10:32 / 07:10:15: programs started from the app.
+        const PROGRAM_1: [u8; 20] = [
+            0xAA, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAE,
+        ];
+        const PROGRAM_3: [u8; 20] = [
+            0xAA, 0x05, 0x00, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAC,
+        ];
+        const PROGRAM_4: [u8; 20] = [
+            0xAA, 0x05, 0x00, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAB,
+        ];
+
+        #[test]
+        fn active_program_frames() {
+            assert_eq!(decode(&IDLE), active(0));
+            assert_eq!(decode(&PROGRAM_1), active(1));
+            assert_eq!(decode(&PROGRAM_3), active(3));
+            assert_eq!(decode(&PROGRAM_4), active(4));
+        }
+
+        #[test]
+        fn program_phase_frames() {
+            for (frame, program, phase) in [
+                // idle, program 1 running, program 4, program 3
+                (
+                    [
+                        0xAA, 0x19, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xB3,
+                    ],
+                    0,
+                    0,
+                ),
+                (
+                    [
+                        0xAA, 0x19, 0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xB0,
+                    ],
+                    1,
+                    2,
+                ),
+                (
+                    [
+                        0xAA, 0x19, 0x04, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xB6,
+                    ],
+                    4,
+                    1,
+                ),
+                (
+                    [
+                        0xAA, 0x19, 0x03, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xB1,
+                    ],
+                    3,
+                    1,
+                ),
+            ] {
+                assert_eq!(
+                    decode(&frame),
+                    GoveeBlePacket::NotifyRiceCookerProgramPhase(NotifyRiceCookerProgramPhase {
+                        program,
+                        phase
+                    })
+                );
+            }
+        }
+
+        /// The set temperature moved 131.00°F -> 149.00°F -> 113.00°F
+        /// (= 55/65/45°C) as it was changed in the Govee app.
+        #[test]
+        fn program_1_set_temperature_follows_the_app() {
+            // 07:09:46: program 1 running, set temperature 131.00°F
+            let f1: [u8; 20] = [
+                0xAA, 0x05, 0x01, 0x00, 0x00, 0x00, 0x01, 0x33, 0x2C, 0x02, 0xD0, 0x01, 0x00, 0x2D,
+                0x00, 0x00, 0x2D, 0x02, 0x00, 0x61,
+            ];
+            // 07:09:55: still 149.00°F, but the byte before the
+            // temperature blipped 01 -> 00 (meaning unknown); the
+            // temperature must still decode.
+            let f2: [u8; 20] = [
+                0xAA, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x3A, 0x34, 0x02, 0xD0, 0x01, 0x00, 0x2D,
+                0x00, 0x00, 0x2D, 0x02, 0x00, 0x71,
+            ];
+            // 07:10:06: program stopped; residual report with the
+            // trailing fields zeroed keeps the last set temperature.
+            let f3: [u8; 20] = [
+                0xAA, 0x05, 0x01, 0x00, 0x00, 0x00, 0x01, 0x2C, 0x24, 0x02, 0xD0, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x75,
+            ];
+            for (frame, centi_f) in [(f1, 13100), (f2, 14900), (f3, 11300)] {
+                match decode(&frame) {
+                    GoveeBlePacket::NotifyRiceCookerProgramParams(p) => {
+                        assert_eq!(p.program, 1);
+                        assert_eq!(p.set_temperature_centi_fahrenheit(), Some(centi_f));
+                    }
+                    other => panic!("expected program params, got {other:?}"),
+                }
+            }
+        }
+
+        /// Programs 3 and 4 carry the same `01 <temp> 02 D0` block at
+        /// their own offsets, preceded by program-specific bytes whose
+        /// meaning is still unknown (0x46=70 for program 3, 0x03/0x78=120
+        /// for program 4).
+        #[test]
+        fn program_3_and_4_set_temperatures() {
+            // 07:10:32: program 3, set temperature 113.00°F (45°C)
+            let p3: [u8; 20] = [
+                0xAA, 0x05, 0x03, 0x00, 0x46, 0x00, 0x00, 0x01, 0x2C, 0x24, 0x02, 0xD0, 0x01, 0x00,
+                0x00, 0x00, 0x00, 0x01, 0x00, 0x31,
+            ];
+            // 07:10:15: program 4, set temperature 131.00°F (55°C)
+            let p4: [u8; 20] = [
+                0xAA, 0x05, 0x04, 0x03, 0x00, 0x78, 0x00, 0x00, 0x01, 0x33, 0x2C, 0x02, 0xD0, 0x01,
+                0x00, 0x00, 0x00, 0x00, 0x01, 0x1C,
+            ];
+            match decode(&p3) {
+                GoveeBlePacket::NotifyRiceCookerProgramParams(p) => {
+                    assert_eq!(p.program, 3);
+                    assert_eq!(p.set_temperature_centi_fahrenheit(), Some(11300));
+                }
+                other => panic!("expected program params, got {other:?}"),
+            }
+            match decode(&p4) {
+                GoveeBlePacket::NotifyRiceCookerProgramParams(p) => {
+                    assert_eq!(p.program, 4);
+                    assert_eq!(p.set_temperature_centi_fahrenheit(), Some(13100));
+                }
+                other => panic!("expected program params, got {other:?}"),
+            }
+        }
+
+        /// Frames the capture did not explain stay Generic: the other
+        /// status families, a corrupted frame, and the one `AB`-prefixed
+        /// ptReal event (which also fails the XOR checksum by 0x02 —
+        /// the AB dialect's checksum is an open question).
+        #[test]
+        fn unexplained_frames_stay_generic() {
+            // status families 0x22/0x17 (07:09:35 burst)
+            let keep_warm_store: [u8; 20] = [
+                0xAA, 0x22, 0x00, 0x33, 0x2C, 0x02, 0xD0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x45,
+            ];
+            let family_17: [u8; 20] = [
+                0xAA, 0x17, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xBD,
+            ];
+            // PROGRAM_3 with one bit flipped -> checksum no longer matches
+            let mut corrupted = PROGRAM_3;
+            corrupted[3] = 0x02;
+            // 07:09:39 ptReal event frame
+            let pt_real: [u8; 20] = [
+                0xAB, 0x00, 0x01, 0x00, 0x03, 0x02, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0xAA,
+            ];
+            for frame in [keep_warm_store, family_17, corrupted, pt_real] {
+                assert!(
+                    matches!(decode(&frame), GoveeBlePacket::Generic(_)),
+                    "{frame:02X?} must not decode"
+                );
+            }
+        }
+
+        /// Unknown program layouts must not fabricate a temperature.
+        #[test]
+        fn unknown_program_yields_no_temperature() {
+            let p = NotifyRiceCookerProgramParams {
+                program: 2,
+                params: [0xFF; 16],
+            };
+            assert_eq!(p.set_temperature_centi_fahrenheit(), None);
+        }
     }
 }

@@ -286,7 +286,12 @@ fn load_quirks() -> HashMap<String, Quirk> {
         // device type. Cannot map to Home Assistant." warning and the
         // default-to-Light fallback; `DeviceType::Other` also opts it out
         // of Platform API polling, which cannot work for this device.
-        // No controls are declared: no public capability data exists yet.
+        // No write controls are declared: the command direction has
+        // never been captured. Read-only program/set-temperature
+        // sensors are decoded from the device's account-topic reports
+        // (see the rice cooker codecs in ble.rs). `iot_api_supported`
+        // stays false: several report families are still undecoded,
+        // and passive ingestion works without the flag.
         // Evidence: <https://github.com/wez/govee2mqtt/issues/173>, and
         // the captured account API entry in
         // <https://github.com/homebridge-plugins/homebridge-govee/issues/684>.

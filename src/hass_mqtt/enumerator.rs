@@ -8,7 +8,8 @@ use crate::hass_mqtt::number::{MusicSensitivityNumber, WorkModeNumber};
 use crate::hass_mqtt::scene::SceneConfig;
 use crate::hass_mqtt::select::{SceneModeSelect, WorkModeSelect};
 use crate::hass_mqtt::sensor::{
-    CapabilitySensor, DeviceStatusDiagnostic, GlobalFixedDiagnostic, SceneInfoSensor,
+    CapabilitySensor, DeviceStatusDiagnostic, GlobalFixedDiagnostic, RiceCookerProgramSensor,
+    RiceCookerSetTemperatureSensor, SceneInfoSensor,
 };
 use crate::hass_mqtt::switch::CapabilitySwitch;
 use crate::hass_mqtt::work_mode::ParsedWorkMode;
@@ -174,6 +175,17 @@ pub async fn enumerate_entities_for_device(
         DeviceType::Humidifier | DeviceType::Dehumidifier
     ) {
         entities.add(Humidifier::new(d, state).await?);
+    }
+
+    // Rice cookers (H7180) never appear in the Platform API, so their
+    // read-only state sensors are declared from the quirk identity
+    // rather than from capability metadata. The values come from the
+    // device's account-topic reports; see the rice cooker codecs in
+    // ble.rs. No write controls: the command direction has never been
+    // captured.
+    if matches!(d.device_type(), DeviceType::Other(ref t) if t == "devices.types.rice_cooker") {
+        entities.add(RiceCookerProgramSensor::new(d, state));
+        entities.add(RiceCookerSetTemperatureSensor::new(d, state).await);
     }
 
     if d.device_type() != DeviceType::Light {
