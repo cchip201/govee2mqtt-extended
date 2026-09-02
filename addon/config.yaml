@@ -1,10 +1,10 @@
-name: Govee2MQTT Bridge (Fork)
-image: ghcr.io/florianhorner/govee2mqtt-{arch}
-version: "2026.08.06-bf75797f"
+name: Govee2MQTT Bridge (H7180)
+image: ghcr.io/cchip201/govee2mqtt-{arch}
+version: "2026.09.02-h7180"
 slug: govee2mqtt
 stage: experimental
 description: Fork of wez/govee2mqtt with device fixes, crash hardening, and scene cycling. Prefer upstream unless you need these specific changes.
-url: https://github.com/florianhorner/govee2mqtt-extended
+url: https://github.com/cchip201/govee2mqtt-extended
 arch:
   - amd64
   - aarch64

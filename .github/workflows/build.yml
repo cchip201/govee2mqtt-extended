@@ -22,15 +22,15 @@ on:
       - ".dockerignore"
 
 env:
-  IMAGE: ghcr.io/florianhorner/govee2mqtt
+  IMAGE: ghcr.io/cchip201/govee2mqtt
   # The composable HA build actions do NOT read addon/build.yaml, so the labels
   # and the base-image cosign identity that lived there have to be passed
   # explicitly. Kept here so the addon and test-addon jobs cannot drift apart.
   ADDON_LABELS: |
     io.hass.type=addon
-    io.hass.name=Govee2MQTT Bridge (Fork)
+    io.hass.name=Govee2MQTT Bridge (H7180)
     io.hass.description=Fork of wez/govee2mqtt with device fixes, crash hardening, and scene cycling.
-    io.hass.url=https://github.com/florianhorner/govee2mqtt-extended
+    io.hass.url=https://github.com/cchip201/govee2mqtt-extended
     org.opencontainers.image.title=Home Assistant App: Govee2MQTT Bridge
     org.opencontainers.image.description=Bridges Govee smart home devices to Home Assistant via MQTT.
     org.opencontainers.image.licenses=MIT
@@ -180,10 +180,10 @@ jobs:
         include:
           - arch: amd64
             os: ubuntu-24.04
-            image: ghcr.io/florianhorner/govee2mqtt-amd64
+            image: ghcr.io/cchip201/govee2mqtt-amd64
           - arch: aarch64
             os: ubuntu-24.04-arm
-            image: ghcr.io/florianhorner/govee2mqtt-aarch64
+            image: ghcr.io/cchip201/govee2mqtt-aarch64
     steps:
       # persist-credentials: false — nothing here runs an authenticated git
       # command. apply-tag.sh only reads local history (git show -s), and the
@@ -192,7 +192,7 @@ jobs:
         with:
           persist-credentials: false
       # The published image tag is the addon/config.yaml version, NOT the git
-      # tag name: Supervisor pulls ghcr.io/florianhorner/govee2mqtt-{arch} at
+      # tag name: Supervisor pulls ghcr.io/cchip201/govee2mqtt-{arch} at
       # whatever version addon/config.yaml declares. apply-tag.sh derives that
       # from the HEAD commit, so it stays the source of truth here. Publishing
       # github.ref_name instead would 404 for every install whenever the two
@@ -243,7 +243,7 @@ jobs:
           # published.
           build-args: |
             BUILD_FROM=ghcr.io/home-assistant/${{ matrix.arch }}-base-debian:bookworm
-            GOVEE_IMAGE=ghcr.io/florianhorner/govee2mqtt:${{ github.ref_name }}
+            GOVEE_IMAGE=ghcr.io/cchip201/govee2mqtt:${{ github.ref_name }}
           labels: ${{ env.ADDON_LABELS }}
 
   test-addon:
@@ -275,17 +275,17 @@ jobs:
         include:
           - arch: amd64
             os: ubuntu-24.04
-            image: ghcr.io/florianhorner/govee2mqtt-amd64
+            image: ghcr.io/cchip201/govee2mqtt-amd64
           - arch: aarch64
             os: ubuntu-24.04-arm
-            image: ghcr.io/florianhorner/govee2mqtt-aarch64
+            image: ghcr.io/cchip201/govee2mqtt-aarch64
     steps:
       # persist-credentials: false — same rationale as the addon job above.
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
       # build-image only logs in when push is true, and addon/Dockerfile pulls
-      # ghcr.io/florianhorner/govee2mqtt:latest, so log in explicitly here.
+      # ghcr.io/cchip201/govee2mqtt:latest, so log in explicitly here.
       - name: Login to GHCR
         uses: docker/login-action@v4
         with:
