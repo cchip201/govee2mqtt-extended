@@ -656,14 +656,79 @@ impl NotifyRiceCookerProgramParams {
     /// an offset. The plausibility window is the one homebridge-govee
     /// applies to kettle temperatures (32.00°F..=230.00°F).
     pub fn set_temperature_centi_fahrenheit(&self) -> Option<u16> {
-        let idx = match self.program {
-            1 => 4,
-            3 => 5,
-            4 => 6,
-            _ => return None,
-        };
+        let idx = self.temperature_index()?;
         let value = u16::from_be_bytes([self.params[idx], self.params[idx + 1]]);
         (3200..=23000).contains(&value).then_some(value)
+    }
+
+    /// Byte offset of this program's set-temperature field. Established
+    /// by the 2026-09-01 capture and re-confirmed independently on
+    /// 2026-09-02, when the temperature was raised mid-run on the
+    /// appliance and only this field moved (13100 -> 14900, i.e.
+    /// 131 -> 149 degF). Unknown program ids return `None` rather than
+    /// guessing an offset. Every other field below is located relative
+    /// to this one, so they inherit the same per-program safety.
+    fn temperature_index(&self) -> Option<usize> {
+        match self.program {
+            1 => Some(4),
+            3 => Some(5),
+            4 => Some(6),
+            _ => None,
+        }
+    }
+
+    /// The program's configured duration in minutes, held immediately
+    /// after the temperature field.
+    ///
+    /// Confirmed 2026-09-02: all three known program layouts carried
+    /// 720 at this same relative offset, and the value halved to 360
+    /// the instant the keep-warm duration was changed from 12h to 6h
+    /// on the appliance -- which also fixes the unit as minutes.
+    pub fn duration_minutes(&self) -> Option<u16> {
+        let idx = self.temperature_index()? + 2;
+        let value = u16::from_be_bytes([self.params[idx], self.params[idx + 1]]);
+        (1..=1440).contains(&value).then_some(value)
+    }
+
+    /// Minutes until a delayed program is scheduled to FINISH, or
+    /// `None` when no delayed start is set. Held three bytes before
+    /// the temperature field.
+    ///
+    /// Confirmed 2026-09-02 against two independent schedules set
+    /// minutes apart: rice read 173 for a 01:00 finish and steam read
+    /// 473 for a 06:00 finish, both from 22:07 local -- each landing
+    /// exactly on the requested wall-clock time.
+    ///
+    /// Note this is deliberately NOT sourced from the `AA 16 .. FF FF
+    /// FF FF` frame. That frame looks like a timer and was originally
+    /// guessed to be one, but it stayed pinned at its unset sentinel
+    /// through both schedules above, so it is something else.
+    pub fn scheduled_finish_in_minutes(&self) -> Option<u16> {
+        let idx = self.temperature_index()?.checked_sub(3)?;
+        let value = u16::from_be_bytes([self.params[idx], self.params[idx + 1]]);
+        (1..=1440).contains(&value).then_some(value)
+    }
+}
+
+/// Human-readable name for an H7180 program id.
+///
+/// Every mapping here was confirmed on 2026-09-02 by Colin naming each
+/// program aloud as he started it on the appliance, so these are
+/// observations rather than inferences. Unknown ids fall back to the
+/// numeric form rather than inventing a name.
+///
+/// Keep Warm is deliberately absent: it is not a program. It appears as
+/// program 0 with phase 8, which is why phase 8 also shows up in the
+/// tail of a finished Steam run.
+pub fn rice_cooker_program_name(program: u8) -> String {
+    match program {
+        0 => "Standby".to_string(),
+        1 => "Rice".to_string(),
+        2 => "Saute".to_string(),
+        3 => "Steam".to_string(),
+        4 => "Slow Cook".to_string(),
+        5 => "DIY".to_string(),
+        n => format!("Program {n}"),
     }
 }
 
