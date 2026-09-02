@@ -25,6 +25,93 @@ impl SelectConfig {
     }
 }
 
+/// Program control for the H7180 rice cooker.
+///
+/// Selecting an option sends `33 05 00 <program>`; selecting "Standby"
+/// sends program 0, which is the stop/cancel case. See
+/// [`crate::ble::rice_cooker_set_program_command`] for why that framing
+/// is the write mirror of the reports the device already sends.
+pub struct RiceCookerProgramSelect {
+    select: SelectConfig,
+    device_id: String,
+    state: StateHandle,
+}
+
+impl RiceCookerProgramSelect {
+    pub fn new(device: &ServiceDevice, state: &StateHandle) -> Self {
+        let command_topic = format!("gv2mqtt/{id}/set-cooker-program", id = topic_safe_id(device));
+        let state_topic = format!("gv2mqtt/{id}/notify-cooker-program", id = topic_safe_id(device));
+        let unique_id = format!("gv2mqtt-{id}-cookerProgram", id = topic_safe_id(device));
+
+        Self {
+            select: SelectConfig {
+                base: EntityConfig {
+                    availability_topic: availability_topic(),
+                    name: Some("Program Control".to_string()),
+                    device_class: None,
+                    origin: Origin::default(),
+                    device: Device::for_device(device),
+                    unique_id,
+                    entity_category: None,
+                    icon: Some("mdi:pot-steam-outline".to_string()),
+                },
+                command_topic,
+                state_topic,
+                options: crate::ble::rice_cooker_program_options(),
+            },
+            device_id: device.id.to_string(),
+            state: state.clone(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl EntityInstance for RiceCookerProgramSelect {
+    async fn publish_config(&self, state: &StateHandle, client: &HassClient) -> anyhow::Result<()> {
+        self.select.publish(state, client).await
+    }
+
+    async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
+        let Some(device) = self.state.device_by_id(&self.device_id).await else {
+            log::warn!("Device {} not found in state, skipping notify", self.device_id);
+            return Ok(());
+        };
+        if let Some(program) = device.rice_cooker_program {
+            client
+                .publish(
+                    &self.select.state_topic,
+                    crate::ble::rice_cooker_program_name(program),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// Handles a program selection from Home Assistant.
+pub async fn mqtt_rice_cooker_set_program(
+    Payload(option): Payload<String>,
+    Params(IdParameter { id }): Params<IdParameter>,
+    State(state): State<StateHandle>,
+) -> anyhow::Result<()> {
+    log::info!("mqtt_rice_cooker_set_program: {id}: {option}");
+    let device = state.resolve_device_for_control(&id).await?;
+    let program = crate::ble::rice_cooker_program_id(&option)
+        .ok_or_else(|| anyhow::anyhow!("unknown rice cooker program {option}"))?;
+
+    let command = crate::ble::rice_cooker_set_program_command(program);
+    let iot = state
+        .get_iot_client()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no IoT client; the H7180 has no LAN or platform path"))?;
+    let info = device
+        .undoc_device_info
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no undoc device info for {device}"))?;
+    iot.send_real(&info.entry, command.base64()).await?;
+    Ok(())
+}
+
 pub struct WorkModeSelect {
     select: SelectConfig,
     device_id: String,

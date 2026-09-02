@@ -710,6 +710,41 @@ impl NotifyRiceCookerProgramParams {
     }
 }
 
+/// Build the "set active program" command for an H7180.
+///
+/// Reports arrive as `AA 05 00 <program>`; Govee's protocol uses `0x33` as
+/// the WRITE prefix and `0xAA` as the REPORT prefix throughout this file
+/// (see `SetSceneCode`, which encodes `33 05 04 ..`), so the write mirror
+/// of that report is `33 05 00 <program>`. `finish` applies the same
+/// 20-byte padding and XOR checksum every other command uses.
+///
+/// Program 0 is the stop/cancel case: the appliance reports `program: 0`
+/// when a run ends naturally, so sending 0 asks it to return to standby.
+pub fn rice_cooker_set_program_command(program: u8) -> Base64HexBytes {
+    Base64HexBytes(HexBytes(finish(vec![0x33, 0x05, 0x00, program])))
+}
+
+/// Reverse of [`rice_cooker_program_name`], for turning a Home Assistant
+/// select option back into a program id. Returns `None` for anything not
+/// in the confirmed map so an unexpected option can never be sent to a
+/// heating appliance as a guessed opcode.
+pub fn rice_cooker_program_id(name: &str) -> Option<u8> {
+    match name {
+        "Standby" => Some(0),
+        "Rice" => Some(1),
+        "Saute" => Some(2),
+        "Steam" => Some(3),
+        "Slow Cook" => Some(4),
+        "DIY" => Some(5),
+        _ => None,
+    }
+}
+
+/// The options offered by the Home Assistant select, in program-id order.
+pub fn rice_cooker_program_options() -> Vec<String> {
+    (0..=5u8).map(rice_cooker_program_name).collect()
+}
+
 /// Human-readable name for an H7180 program id.
 ///
 /// Every mapping here was confirmed on 2026-09-02 by Colin naming each

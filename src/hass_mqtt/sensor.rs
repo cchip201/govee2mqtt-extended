@@ -524,8 +524,7 @@ impl EntityInstance for RiceCookerProgramSensor {
 
         let value = match device.rice_cooker_program {
             None => "".to_string(),
-            Some(0) => "Standby".to_string(),
-            Some(n) => format!("Program {n}"),
+            Some(n) => crate::ble::rice_cooker_program_name(n),
         };
 
         let params_hex = device.rice_cooker_params.as_ref().map(|p| {
@@ -544,6 +543,14 @@ impl EntityInstance for RiceCookerProgramSensor {
                 .rice_cooker_params
                 .as_ref()
                 .and_then(|p| p.set_temperature_centi_fahrenheit()),
+            "duration_minutes": device
+                .rice_cooker_params
+                .as_ref()
+                .and_then(|p| p.duration_minutes()),
+            "scheduled_finish_in_minutes": device
+                .rice_cooker_params
+                .as_ref()
+                .and_then(|p| p.scheduled_finish_in_minutes()),
         });
 
         self.sensor.notify_state(client, &value).await?;

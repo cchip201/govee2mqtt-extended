@@ -6,7 +6,7 @@ use crate::hass_mqtt::instance::EntityList;
 use crate::hass_mqtt::light::DeviceLight;
 use crate::hass_mqtt::number::{MusicSensitivityNumber, WorkModeNumber};
 use crate::hass_mqtt::scene::SceneConfig;
-use crate::hass_mqtt::select::{SceneModeSelect, WorkModeSelect};
+use crate::hass_mqtt::select::{RiceCookerProgramSelect, SceneModeSelect, WorkModeSelect};
 use crate::hass_mqtt::sensor::{
     CapabilitySensor, DeviceStatusDiagnostic, GlobalFixedDiagnostic, RiceCookerProgramSensor,
     RiceCookerSetTemperatureSensor, SceneInfoSensor,
@@ -186,6 +186,7 @@ pub async fn enumerate_entities_for_device(
     if matches!(d.device_type(), DeviceType::Other(ref t) if t == "devices.types.rice_cooker") {
         entities.add(RiceCookerProgramSensor::new(d, state));
         entities.add(RiceCookerSetTemperatureSensor::new(d, state).await);
+        entities.add(RiceCookerProgramSelect::new(d, state));
     }
 
     if d.device_type() != DeviceType::Light {

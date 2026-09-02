@@ -140,6 +140,7 @@ fn mqtt_device_dispatch_label(topic: &str) -> Option<&str> {
         | ["gv2mqtt", id, "clear-music-sensitivity"]
         | ["gv2mqtt", id, "set-temperature", _, _]
         | ["gv2mqtt", id, "set-mode-scene"]
+        | ["gv2mqtt", id, "set-cooker-program"]
         | ["gv2mqtt", id, "set-music-palette"] => id,
         _ => return None,
     };
@@ -851,6 +852,12 @@ async fn run_mqtt_loop(
             .await?;
         router
             .route("gv2mqtt/:id/set-work-mode", mqtt_device_set_work_mode)
+            .await?;
+        router
+            .route(
+                "gv2mqtt/:id/set-cooker-program",
+                crate::hass_mqtt::select::mqtt_rice_cooker_set_program,
+            )
             .await?;
         router
             .route(
