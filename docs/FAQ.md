@@ -50,6 +50,19 @@ After purging:
 * **Tap-to-Run** shortcuts appear as Scene entities in Home Assistant.
 * **Snapshots** appear in the Effects list on the device itself.
 
+### TV backlights with a camera (video / "DreamView" mode)
+
+A TV backlight that advertises the `dreamViewToggle` capability gets a
+**Dream View Toggle** switch. Govee's cloud rejects that toggle on some of
+these devices (the H605C answers `400 The device does not has DreamView`),
+so the bridge does not send it to the Platform API: switching **on** sends
+the BLE-style video-mode frame (`33 05 00 01 00 64`: whole screen, movie
+style, full saturation) through `ptReal`, over the LAN when the device
+answers there and otherwise over the AWS IoT session; switching **off**
+writes the last known colour back, because the protocol has no video-off
+opcode. The switch state is the bridge's own record (Govee reports nothing
+for it) and reads *unknown* until the bridge has sent one.
+
 ## My devices appear greyed out / unavailable in Home Assistant
 
 This usually means Home Assistant had trouble registering the device entity

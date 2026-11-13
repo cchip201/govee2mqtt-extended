@@ -78,6 +78,13 @@ pub struct Device {
     /// into music mode and power it on — an unacceptable side effect of moving
     /// a slider. So the value is held here and applied on the next style change.
     music_sensitivity: Option<u8>,
+
+    /// Whether the bridge last put this device into video (camera sync)
+    /// mode. Govee reports nothing for it: the Platform API's
+    /// `dreamViewToggle` state is empty and the IoT status keeps the last
+    /// colour and `mode` (H605C, 2026-11-12), so this latch is the only
+    /// record. `None` until the bridge has sent either direction.
+    video_mode: Option<bool>,
 }
 
 impl std::fmt::Display for Device {
@@ -473,6 +480,22 @@ impl Device {
     /// and by `clear_scene_if_light_powered_off` when the device reports the light off.
     pub fn set_active_scene(&mut self, scene: Option<&str>) {
         self.active_scene = scene.map(|s| s.to_string());
+        // Every path that reaches here wrote a colour, temperature or
+        // scene, and any of those leaves video mode (there is no off
+        // opcode). The video-mode path itself re-latches after this call.
+        if self.video_mode == Some(true) {
+            self.video_mode = Some(false);
+        }
+    }
+
+    /// Record that the bridge put the device into, or out of, video mode.
+    pub fn set_video_mode(&mut self, on: bool) {
+        self.video_mode = Some(on);
+    }
+
+    /// The bridge's own record of video mode; `None` until it has sent one.
+    pub fn video_mode(&self) -> Option<bool> {
+        self.video_mode
     }
 
     /// Sensitivity to apply on the next `Music:` effect selection. The fallback

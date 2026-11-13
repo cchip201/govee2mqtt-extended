@@ -755,6 +755,16 @@ async fn mqtt_switch_command(
 
     if instance == "powerSwitch" {
         state.device_power_on(&device, on).await?;
+    } else if instance == "dreamViewToggle" {
+        // Govee's cloud answers this toggle with 400 "The device does not
+        // has DreamView" on the H605C although the device advertises the
+        // capability (2026-11-12), so the switch drives the BLE-style video
+        // frame over ptReal instead; OFF writes the last colour back.
+        if on {
+            state.device_set_video_mode(&device).await?;
+        } else {
+            state.device_leave_video_mode(&device).await?;
+        }
     } else if let Some(client) = state.get_platform_client().await {
         if let Some(http_dev) = &device.http_device_info {
             client.set_toggle_state(http_dev, &instance, on).await?;

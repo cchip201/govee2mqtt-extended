@@ -108,6 +108,18 @@ impl EntityInstance for CapabilitySwitch {
             return Ok(());
         }
 
+        if self.instance_name == "dreamViewToggle" {
+            // Govee reports nothing for this toggle (empty Platform state,
+            // unchanged IoT colour and mode), so the bridge's own latch from
+            // the ptReal video-mode path is the state; unknown until used.
+            if let Some(on) = device.video_mode() {
+                client
+                    .publish(&self.switch.state_topic, if on { "ON" } else { "OFF" })
+                    .await?;
+            }
+            return Ok(());
+        }
+
         // TODO: currently, Govee don't return any meaningful data on
         // additional states. When they do, we'll need to start reporting
         // it here, but we'll also need to start polling it from the

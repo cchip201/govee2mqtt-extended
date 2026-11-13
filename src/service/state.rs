@@ -976,6 +976,70 @@ impl State {
         );
     }
 
+    /// Put a TV backlight into video (camera sync) mode: whole screen,
+    /// movie style, full saturation. The Platform API's `dreamViewToggle`
+    /// answers 400 "The device does not has DreamView" on the H605C even
+    /// though the device advertises the capability, so the BLE-style frame
+    /// rides `ptReal`: over the LAN when the device answers there (sent
+    /// twice, UDP has no acknowledgement), otherwise over the AWS IoT
+    /// session, which is the route verified on the H605C. Leaving the mode
+    /// is any colour write: see `device_leave_video_mode`.
+    pub async fn device_set_video_mode(self: &Arc<Self>, device: &Device) -> anyhow::Result<()> {
+        let encoded = crate::ble::video_mode_command(true, false, 100).base64();
+
+        if let Some(lan_dev) = &device.lan_device {
+            log::info!("Using LAN API to set {device} video mode");
+            lan_dev.send_real(encoded.clone()).await?;
+            sleep(Duration::from_millis(300)).await;
+            lan_dev.send_real(encoded).await?;
+            let mut canonical = self.device_mut(&device.sku, &device.id).await;
+            canonical.set_active_scene(None);
+            canonical.set_video_mode(true);
+            return Ok(());
+        }
+
+        if let Some(iot) = self.get_iot_client().await {
+            if let Some(info) = &device.undoc_device_info {
+                log::info!("Using IoT API to set {device} video mode");
+                iot.send_real(&info.entry, encoded).await?;
+                let mut canonical = self.device_mut(&device.sku, &device.id).await;
+                canonical.set_active_scene(None);
+                canonical.set_video_mode(true);
+                return Ok(());
+            }
+        }
+
+        anyhow::bail!(
+            "Unable to set video mode for {device}: it answers neither on the \
+             LAN nor through the AWS IoT session"
+        );
+    }
+
+    /// Leave video mode by writing the last known colour (or colour
+    /// temperature) back: the protocol has no video-off opcode, a device
+    /// drops the mode as soon as it is given another one. With no known
+    /// state the light goes to 6500 K white.
+    pub async fn device_leave_video_mode(self: &Arc<Self>, device: &Device) -> anyhow::Result<()> {
+        match device.device_state() {
+            Some(state) if state.kelvin != 0 => {
+                self.device_set_color_temperature(device, state.kelvin)
+                    .await?;
+            }
+            Some(state) => {
+                let color = state.color;
+                self.device_set_color_rgb(device, color.r, color.g, color.b)
+                    .await?;
+            }
+            None => {
+                self.device_set_color_temperature(device, 6500).await?;
+            }
+        }
+        self.device_mut(&device.sku, &device.id)
+            .await
+            .set_video_mode(false);
+        Ok(())
+    }
+
     // Take care not to call this while you hold a mutable device
     // reference, as that will deadlock!
     pub async fn notify_of_state_change(self: &Arc<Self>, device_id: &str) -> anyhow::Result<()> {

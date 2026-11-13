@@ -745,6 +745,25 @@ pub fn rice_cooker_program_options() -> Vec<String> {
     (0..=5u8).map(rice_cooker_program_name).collect()
 }
 
+/// Video ("DreamView" / camera sync) mode for TV backlights, as the
+/// BLE-style frame `33 05 00 <screen> <style> <saturation>`: `screen` 1 =
+/// whole screen, 0 = part of it; `style` 0 = movie, 1 = game; `saturation`
+/// 0-100. Reverse-engineered on the H6199 (Obi2000/Govee-H6199-Reverse-
+/// Engineering) and verified on an H605C over AWS IoT `ptReal`
+/// (lasswellt/govee-homeassistant#187; 2026-11-12 here: the frame put the
+/// strip dark on a black screen, a colour write lit it again). There is no
+/// video-off opcode: any colour, temperature or scene write leaves the mode.
+pub fn video_mode_command(whole_screen: bool, game_style: bool, saturation: u8) -> Base64HexBytes {
+    Base64HexBytes(HexBytes(finish(vec![
+        0x33,
+        0x05,
+        0x00,
+        u8::from(whole_screen),
+        u8::from(game_style),
+        saturation.min(100),
+    ])))
+}
+
 /// Human-readable name for an H7180 program id.
 ///
 /// Every mapping here was confirmed on 2026-09-02 by Colin naming each
@@ -1243,6 +1262,40 @@ a3 ff 05 0a 0f 06 0c 12 07 0e 15 00 00 00 00 00 00 00 00 58
                 params: [0xFF; 16],
             };
             assert_eq!(p.set_temperature_centi_fahrenheit(), None);
+        }
+    }
+
+    mod video_mode {
+        use super::*;
+
+        /// `33 05 00 01 00 64` = whole screen, movie style, full saturation:
+        /// the frame lasswellt/govee-homeassistant#187 verified on an H605C
+        /// over AWS IoT `ptReal`; XOR checksum 0x53.
+        #[test]
+        fn whole_screen_movie_full_saturation() {
+            assert_eq!(
+                video_mode_command(true, false, 100).base64(),
+                vec!["MwUAAQBkAAAAAAAAAAAAAAAAAFM=".to_string()]
+            );
+        }
+
+        #[test]
+        fn saturation_is_clamped_to_100() {
+            assert_eq!(
+                video_mode_command(true, false, 255).base64(),
+                video_mode_command(true, false, 100).base64()
+            );
+        }
+
+        #[test]
+        fn part_screen_game_style() {
+            let expected = [
+                0x33, 0x05, 0x00, 0x00, 0x01, 0x32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05,
+            ];
+            assert_eq!(
+                video_mode_command(false, true, 50).base64(),
+                vec![data_encoding::BASE64.encode(&expected)]
+            );
         }
     }
 }
