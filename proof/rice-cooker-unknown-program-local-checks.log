@@ -1,0 +1,41 @@
+== rice cooker: unknown program publishes nothing — local checks 2026-11-20 ==
+Run in a rust:latest container on docker-dev against the tree of this commit
+(src/hass_mqtt/sensor.rs sha256 8810d5e1046d6c42...90c9).
+$ rustc --version
+rustc 1.100.0 (0ef1bc386 2026-11-09)
+
+== cargo test --all (new tests) ==
+test hass_mqtt::sensor::test::known_set_temperature_is_converted_to_the_scale ... ok
+test hass_mqtt::sensor::test::params_without_a_program_publish_attributes_only ... ok
+test hass_mqtt::sensor::test::reported_block_without_a_known_temperature_still_clears_it ... ok
+test hass_mqtt::sensor::test::standby_is_a_real_value_and_is_published ... ok
+test hass_mqtt::sensor::test::unknown_program_publishes_nothing ... ok
+test hass_mqtt::sensor::test::unknown_set_temperature_publishes_nothing ... ok
+
+== cargo build --all ==
+exit 0
+
+== cargo test --all ==
+test result: ok. 267 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.85s
+
+== cargo test --all --all-features ==
+test result: ok. 268 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.84s
+
+== cargo clippy --all -- -D warnings ==
+exit 0
+
+== cargo clippy --all --all-features -- -D warnings ==
+exit 0
+
+== cargo fmt --all -- --check ==
+src/hass_mqtt/sensor.rs: clean.
+src/hass_mqtt/select.rs: 2 diffs, present on main before this change (RiceCookerProgramSelect, not touched here).
+
+== negative control ==
+With the three "nothing to say" branches replaced by the old behaviour (an empty
+state for an unknown program, attributes always published, an empty temperature
+for an unknown block), the same tests give:
+test hass_mqtt::sensor::test::params_without_a_program_publish_attributes_only ... FAILED
+test hass_mqtt::sensor::test::unknown_program_publishes_nothing ... FAILED
+test hass_mqtt::sensor::test::unknown_set_temperature_publishes_nothing ... FAILED
+test result: FAILED. 7 passed; 3 failed; 0 ignored; 0 measured; 257 filtered out

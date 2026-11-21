@@ -479,6 +479,59 @@ impl EntityInstance for SceneInfoSensor {
     }
 }
 
+/// What the rice cooker Program sensor publishes for a device, if anything.
+///
+/// The H7180 only reports on its account IoT topic while it is used, so
+/// after a bridge restart `rice_cooker_program` is `None` until the next
+/// report. An unknown program must not be published as an empty state:
+/// it overwrites the value Home Assistant still holds (and the kiosk's
+/// "Rice Cooker" live card then reads the blank as cooking). `None`
+/// means "nothing to say", so the last published value stays.
+#[derive(Debug, PartialEq)]
+struct RiceCookerProgramReport {
+    state: Option<String>,
+    attributes: Option<serde_json::Value>,
+}
+
+fn rice_cooker_program_report(device: &ServiceDevice) -> RiceCookerProgramReport {
+    let state = device
+        .rice_cooker_program
+        .map(crate::ble::rice_cooker_program_name);
+
+    // The attribute block is all-null until something is reported; publishing
+    // that would blank the attributes Home Assistant already holds.
+    let attributes = (device.rice_cooker_program.is_some() || device.rice_cooker_params.is_some())
+        .then(|| {
+            let params_hex = device.rice_cooker_params.as_ref().map(|p| {
+                p.params
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
+            json!({
+                "program": device.rice_cooker_program,
+                "phase": device.rice_cooker_phase,
+                "params_program": device.rice_cooker_params.as_ref().map(|p| p.program),
+                "params_hex": params_hex,
+                "set_temperature_centi_fahrenheit": device
+                    .rice_cooker_params
+                    .as_ref()
+                    .and_then(|p| p.set_temperature_centi_fahrenheit()),
+                "duration_minutes": device
+                    .rice_cooker_params
+                    .as_ref()
+                    .and_then(|p| p.duration_minutes()),
+                "scheduled_finish_in_minutes": device
+                    .rice_cooker_params
+                    .as_ref()
+                    .and_then(|p| p.scheduled_finish_in_minutes()),
+            })
+        });
+
+    RiceCookerProgramReport { state, attributes }
+}
+
 /// The rice cooker's active program, decoded from the `AA 05 00` /
 /// `AA 19` report frames on the account IoT topic (see the rice
 /// cooker codecs in ble.rs for the capture evidence). Program ids are
@@ -537,43 +590,48 @@ impl EntityInstance for RiceCookerProgramSensor {
             return Ok(());
         };
 
-        let value = match device.rice_cooker_program {
-            None => "".to_string(),
-            Some(n) => crate::ble::rice_cooker_program_name(n),
-        };
+        let report = rice_cooker_program_report(&device);
+        if report.state.is_none() && report.attributes.is_none() {
+            log::debug!(
+                "Rice cooker {} has reported no program since the bridge started; \
+                 publishing nothing",
+                self.device_id
+            );
+            return Ok(());
+        }
 
-        let params_hex = device.rice_cooker_params.as_ref().map(|p| {
-            p.params
-                .iter()
-                .map(|b| format!("{b:02X}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        });
-        let attributes = json!({
-            "program": device.rice_cooker_program,
-            "phase": device.rice_cooker_phase,
-            "params_program": device.rice_cooker_params.as_ref().map(|p| p.program),
-            "params_hex": params_hex,
-            "set_temperature_centi_fahrenheit": device
-                .rice_cooker_params
-                .as_ref()
-                .and_then(|p| p.set_temperature_centi_fahrenheit()),
-            "duration_minutes": device
-                .rice_cooker_params
-                .as_ref()
-                .and_then(|p| p.duration_minutes()),
-            "scheduled_finish_in_minutes": device
-                .rice_cooker_params
-                .as_ref()
-                .and_then(|p| p.scheduled_finish_in_minutes()),
-        });
-
-        self.sensor.notify_state(client, &value).await?;
-        if let Some(topic) = &self.sensor.json_attributes_topic {
+        if let Some(value) = &report.state {
+            self.sensor.notify_state(client, value).await?;
+        }
+        if let (Some(topic), Some(attributes)) =
+            (&self.sensor.json_attributes_topic, report.attributes)
+        {
             client.publish_obj(topic, attributes).await?;
         }
         Ok(())
     }
+}
+
+/// The Set Temperature state to publish, or `None` when there is nothing to say.
+///
+/// `None` means no parameter block has arrived since the bridge started (the
+/// cooker only reports when used): the last published value stays, rather than
+/// being overwritten with an empty state. A block that did arrive but whose
+/// program has no known temperature field still publishes an empty state, so a
+/// stale temperature from another program is not left standing.
+fn rice_cooker_set_temperature_state(
+    device: &ServiceDevice,
+    scale: crate::temperature::TemperatureScale,
+) -> Option<String> {
+    let params = device.rice_cooker_params.as_ref()?;
+    Some(match params.set_temperature_centi_fahrenheit() {
+        Some(centi_f) => {
+            let temperature =
+                TemperatureValue::new(f64::from(centi_f) / 100.0, TemperatureUnits::Fahrenheit);
+            format!("{:.2}", temperature.as_unit(scale.into()).value())
+        }
+        None => "".to_string(),
+    })
 }
 
 /// The set temperature of the rice cooker's current (or most recent)
@@ -633,18 +691,14 @@ impl EntityInstance for RiceCookerSetTemperatureSensor {
             return Ok(());
         };
 
-        let value = match device
-            .rice_cooker_params
-            .as_ref()
-            .and_then(|p| p.set_temperature_centi_fahrenheit())
-        {
-            Some(centi_f) => {
-                let temperature =
-                    TemperatureValue::new(f64::from(centi_f) / 100.0, TemperatureUnits::Fahrenheit);
-                let scale = self.state.get_temperature_scale().await;
-                format!("{:.2}", temperature.as_unit(scale.into()).value())
-            }
-            None => "".to_string(),
+        let scale = self.state.get_temperature_scale().await;
+        let Some(value) = rice_cooker_set_temperature_state(&device, scale) else {
+            log::debug!(
+                "Rice cooker {} has reported no program parameters since the bridge started; \
+                 publishing nothing",
+                self.device_id
+            );
+            return Ok(());
         };
 
         self.sensor.notify_state(client, &value).await
@@ -655,6 +709,7 @@ impl EntityInstance for RiceCookerSetTemperatureSensor {
 mod test {
     use super::*;
     use crate::lan_api::{DeviceColor, DeviceStatus as LanDeviceStatus};
+    use crate::temperature::TemperatureScale;
 
     fn frame(brightness: u8) -> LanDeviceStatus {
         LanDeviceStatus {
@@ -737,5 +792,82 @@ mod test {
 
         let beyond = polled + *POLL_INTERVAL + chrono::Duration::seconds(31);
         assert_eq!(status_report(&device, beyond).0, "Missing");
+    }
+
+    fn cooker() -> ServiceDevice {
+        ServiceDevice::new("H7180", "16:03:AA:BB:CC:DD:EE:FF")
+    }
+
+    /// Program 3 block of the 07:10:32 capture: set temperature 113.00 F (45 C).
+    fn program_3_params() -> crate::ble::NotifyRiceCookerProgramParams {
+        crate::ble::NotifyRiceCookerProgramParams {
+            program: 3,
+            params: [
+                0x00, 0x46, 0x00, 0x00, 0x01, 0x2C, 0x24, 0x02, 0xD0, 0x01, 0x00, 0x00, 0x00, 0x00,
+                0x01, 0x00,
+            ],
+        }
+    }
+
+    /// A bridge restart leaves the cooker with no program until it is used again.
+    /// That must publish nothing, not an empty state over the value Home Assistant holds.
+    #[test]
+    fn unknown_program_publishes_nothing() {
+        let report = rice_cooker_program_report(&cooker());
+        assert_eq!(report.state, None);
+        assert_eq!(report.attributes, None);
+    }
+
+    #[test]
+    fn standby_is_a_real_value_and_is_published() {
+        let mut device = cooker();
+        device.set_rice_cooker_program(0);
+        let report = rice_cooker_program_report(&device);
+        assert_eq!(report.state.as_deref(), Some("Standby"));
+        let attributes = report.attributes.expect("attributes with a known program");
+        assert_eq!(attributes["program"], 0);
+    }
+
+    /// A parameter block without a program still has content worth publishing as
+    /// attributes, but no state is invented for the program.
+    #[test]
+    fn params_without_a_program_publish_attributes_only() {
+        let mut device = cooker();
+        device.set_rice_cooker_params(program_3_params());
+        let report = rice_cooker_program_report(&device);
+        assert_eq!(report.state, None);
+        let attributes = report.attributes.expect("attributes from the params block");
+        assert_eq!(attributes["params_program"], 3);
+        assert_eq!(attributes["set_temperature_centi_fahrenheit"], 11300);
+    }
+
+    #[test]
+    fn unknown_set_temperature_publishes_nothing() {
+        let device = cooker();
+        for scale in [TemperatureScale::Celsius, TemperatureScale::Fahrenheit] {
+            assert_eq!(rice_cooker_set_temperature_state(&device, scale), None);
+        }
+    }
+
+    #[test]
+    fn known_set_temperature_is_converted_to_the_scale() {
+        let mut device = cooker();
+        device.set_rice_cooker_params(program_3_params());
+        let celsius = rice_cooker_set_temperature_state(&device, TemperatureScale::Celsius);
+        let fahrenheit = rice_cooker_set_temperature_state(&device, TemperatureScale::Fahrenheit);
+        assert_eq!(celsius.as_deref(), Some("45.00"));
+        assert_eq!(fahrenheit.as_deref(), Some("113.00"));
+    }
+
+    /// The cooker did report, but for a program whose temperature field is not known:
+    /// the empty state stays, so no stale temperature from another program is left up.
+    #[test]
+    fn reported_block_without_a_known_temperature_still_clears_it() {
+        let mut device = cooker();
+        let mut params = program_3_params();
+        params.program = 9;
+        device.set_rice_cooker_params(params);
+        let shown = rice_cooker_set_temperature_state(&device, TemperatureScale::Celsius);
+        assert_eq!(shown.as_deref(), Some(""));
     }
 }
