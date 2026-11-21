@@ -1,0 +1,32 @@
+== status sensor: per-poll stamps out of the attributes — local checks 2026-11-20 ==
+Run in a rust:latest container on docker-dev against the tree of this commit.
+$ rustc --version
+rustc 1.100.0 (0ef1bc386 2026-11-09)
+
+== cargo test --all (new tests) ==
+test hass_mqtt::sensor::test::attributes_carry_no_poll_stamp_but_keep_the_content ... ok
+test hass_mqtt::sensor::test::real_change_still_changes_attributes ... ok
+test hass_mqtt::sensor::test::repeated_poll_leaves_attributes_unchanged ... ok
+test hass_mqtt::sensor::test::summary_follows_the_age_of_the_last_poll ... ok
+
+== cargo test --all ==
+test result: ok. 261 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.85s
+
+== cargo test --all --all-features ==
+test result: ok. 262 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.86s
+
+== cargo clippy --all -- -D warnings ==
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 3m 18s
+
+== cargo clippy --all --all-features -- -D warnings ==
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.58s
+
+== cargo fmt --all -- --check ==
+src/hass_mqtt/sensor.rs: clean.
+src/hass_mqtt/select.rs: 2 diffs, present on main before this change (RiceCookerProgramSelect, not touched here).
+
+== negative control ==
+With the line that removes `updated` replaced by a no-op, the same tests give:
+test hass_mqtt::sensor::test::attributes_carry_no_poll_stamp_but_keep_the_content ... FAILED
+test hass_mqtt::sensor::test::repeated_poll_leaves_attributes_unchanged ... FAILED
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out

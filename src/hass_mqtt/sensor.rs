@@ -9,7 +9,7 @@ use crate::service::quirks::HumidityUnits;
 use crate::service::state::StateHandle;
 use crate::temperature::{TemperatureUnits, TemperatureValue, DEVICE_CLASS_TEMPERATURE};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::json;
 
@@ -227,6 +227,50 @@ impl EntityInstance for CapabilitySensor {
     }
 }
 
+/// The Status sensor's state ("Available", "Missing" or "Unknown") and its attribute block.
+///
+/// Every device-state projection carries an `updated` stamp that moves on each poll. Left in
+/// the attributes, it made Home Assistant record a new state row (with the whole 2-6 KB block)
+/// every 20-30 seconds for a device whose content had not changed. The stamps stay out of the
+/// attributes so the block only changes when the device's real state does; the summary still
+/// reads `updated`, so Available/Missing keeps its meaning.
+fn status_report(device: &ServiceDevice, now: DateTime<Utc>) -> (String, serde_json::Value) {
+    let device_state = device.device_state();
+
+    let threshold = *POLL_INTERVAL + chrono::Duration::seconds(30);
+
+    let summary = match &device_state {
+        Some(state) => {
+            if now - state.updated > threshold {
+                "Missing".to_string()
+            } else {
+                "Available".to_string()
+            }
+        }
+        None => "Unknown".to_string(),
+    };
+
+    let mut attributes = json!({
+        "iot": device.compute_iot_device_state(),
+        "lan": device.compute_lan_device_state(),
+        "http": device.compute_http_device_state(),
+        "platform_metadata": &device.http_device_info,
+        "platform_state": &device.http_device_state,
+        "overall": device_state,
+    });
+
+    for projection in ["iot", "lan", "http", "overall"] {
+        if let Some(fields) = attributes
+            .get_mut(projection)
+            .and_then(|value| value.as_object_mut())
+        {
+            fields.remove("updated");
+        }
+    }
+
+    (summary, attributes)
+}
+
 pub struct DeviceStatusDiagnostic {
     sensor: SensorConfig,
     device_id: String,
@@ -275,36 +319,7 @@ impl EntityInstance for DeviceStatusDiagnostic {
             return Ok(());
         };
 
-        let iot_state = device.compute_iot_device_state();
-        let lan_state = device.compute_lan_device_state();
-        let http_state = device.compute_http_device_state();
-        let platform_metadata = &device.http_device_info;
-        let platform_state = &device.http_device_state;
-        let device_state = device.device_state();
-
-        let now = Utc::now();
-
-        let threshold = *POLL_INTERVAL + chrono::Duration::seconds(30);
-
-        let summary = match &device_state {
-            Some(state) => {
-                if now - state.updated > threshold {
-                    "Missing".to_string()
-                } else {
-                    "Available".to_string()
-                }
-            }
-            None => "Unknown".to_string(),
-        };
-
-        let attributes = json!({
-            "iot": iot_state,
-            "lan": lan_state,
-            "http": http_state,
-            "platform_metadata": platform_metadata,
-            "platform_state": platform_state,
-            "overall": device_state,
-        });
+        let (summary, attributes) = status_report(&device, Utc::now());
 
         self.sensor.notify_state(client, &summary).await?;
         if let Some(topic) = &self.sensor.json_attributes_topic {
@@ -633,5 +648,94 @@ impl EntityInstance for RiceCookerSetTemperatureSensor {
         };
 
         self.sensor.notify_state(client, &value).await
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::lan_api::{DeviceColor, DeviceStatus as LanDeviceStatus};
+
+    fn frame(brightness: u8) -> LanDeviceStatus {
+        LanDeviceStatus {
+            on: true,
+            brightness,
+            color: DeviceColor { r: 1, g: 2, b: 3 },
+            color_temperature_kelvin: 0,
+            mode: None,
+        }
+    }
+
+    /// Two polls that report the same thing, a moment apart, must give the same attribute
+    /// block: Home Assistant writes a state row whenever the attributes differ.
+    #[test]
+    fn repeated_poll_leaves_attributes_unchanged() {
+        let mut device = ServiceDevice::new("H6000", "AA:BB:CC:DD:EE:FF:42:2A");
+        device.set_lan_device_status(frame(100));
+        let (first_summary, first) = status_report(&device, Utc::now());
+        let first_stamp = device.device_state().expect("lan state").updated;
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        device.set_lan_device_status(frame(100));
+        let (second_summary, second) = status_report(&device, Utc::now());
+        let second_stamp = device.device_state().expect("lan state").updated;
+
+        assert!(second_stamp > first_stamp, "the poll moved its own stamp");
+        assert_eq!(first, second);
+        assert_eq!(first_summary, "Available");
+        assert_eq!(second_summary, "Available");
+    }
+
+    /// The stamps are gone from every projection, and nothing else is.
+    #[test]
+    fn attributes_carry_no_poll_stamp_but_keep_the_content() {
+        let mut device = ServiceDevice::new("H6000", "AA:BB:CC:DD:EE:FF:42:2A");
+        device.set_lan_device_status(frame(100));
+        let (_, attributes) = status_report(&device, Utc::now());
+
+        for projection in ["iot", "lan", "http", "overall"] {
+            if let Some(fields) = attributes[projection].as_object() {
+                assert!(
+                    !fields.contains_key("updated"),
+                    "{projection} still has `updated`"
+                );
+            }
+        }
+        assert_eq!(attributes["lan"]["brightness"], 100);
+        assert_eq!(attributes["lan"]["source"], "LAN API");
+        assert_eq!(attributes["overall"]["brightness"], 100);
+        assert!(attributes["iot"].is_null());
+    }
+
+    /// A real change in the device still changes the block, so the sensor still updates.
+    #[test]
+    fn real_change_still_changes_attributes() {
+        let mut device = ServiceDevice::new("H6000", "AA:BB:CC:DD:EE:FF:42:2A");
+        device.set_lan_device_status(frame(100));
+        let (_, before) = status_report(&device, Utc::now());
+
+        device.set_lan_device_status(frame(40));
+        let (_, after) = status_report(&device, Utc::now());
+
+        assert_ne!(before, after);
+        assert_eq!(after["overall"]["brightness"], 40);
+    }
+
+    /// The summary still follows the age of the last poll, although that stamp is no longer
+    /// part of the attributes.
+    #[test]
+    fn summary_follows_the_age_of_the_last_poll() {
+        let unknown = ServiceDevice::new("H6000", "AA:BB:CC:DD:EE:FF:42:2A");
+        assert_eq!(status_report(&unknown, Utc::now()).0, "Unknown");
+
+        let mut device = ServiceDevice::new("H6000", "AA:BB:CC:DD:EE:FF:42:2A");
+        device.set_lan_device_status(frame(100));
+        let polled = device.device_state().expect("lan state").updated;
+
+        let within = polled + *POLL_INTERVAL;
+        assert_eq!(status_report(&device, within).0, "Available");
+
+        let beyond = polled + *POLL_INTERVAL + chrono::Duration::seconds(31);
+        assert_eq!(status_report(&device, beyond).0, "Missing");
     }
 }
